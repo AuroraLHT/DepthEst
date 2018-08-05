@@ -1,0 +1,9 @@
+!/tmp
+/tmp/*
+/.ipynb_checkpoints
+!/.ipynb_checkpoints/*
+submit.bash
+__pycache__/*
+!__pycache__
+*.csv
+*.tar*
