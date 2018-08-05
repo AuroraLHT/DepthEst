@@ -1,3 +1,4 @@
 #!/bin/bash
 
-aria2c -i "fullurl.txt" -j4
+python3 checkdownloaded.py
+aria2c -i "resturl.txt" -j4
