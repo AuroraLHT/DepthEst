@@ -5,6 +5,10 @@
 submit.bash
 __pycache__/*
 !__pycache__
+*__pycache__*
 *.csv
 *.tar*
 *.zip*
+pytorch_ssim/*
+*.pyc
+fastai

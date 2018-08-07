@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from pytorch_ssim import SSIM
 
+import fastai
 from fastai.conv_learner import *
 
 # part of architecture is copied from fastai library
@@ -40,19 +41,20 @@ class UnetBlock(nn.Module):
 class Pose(nn.Module):
     def __init__(self, inc):
         super().__init__()
+        self.ps = 6
+        self.multi = 2
         self.body = nn.Sequential(
-            nn.Conv2d(inc, 256),
+            nn.Conv2d(inc, 256, 3),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256),
+            nn.Conv2d(256, 256, 3),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(256, self.ps*self.multi, 3),
             nn.AdaptiveAvgPool2d((1,1))
         )
     def forward(self, x):
         x = self.body(x)
         batch, c, h, w = x.size()
-        return x.view(batch, 2, c//2)
+        return x.view(batch, self.multi, self.ps)
 
 class Depth34(nn.Module):
     def __init__(self, rn, ochannel):
@@ -76,7 +78,7 @@ class Depth34(nn.Module):
         x = self.up4(x, self.sfs[0].features)
         x = self.up5(x, inp)
         x = self.up6(x)
-        return x, sfs
+        return F.sigmoid(x), self.sfs[3].features
     
     def close(self):
         for sf in self.sfs: sf.remove()
@@ -95,9 +97,6 @@ class TriDepth(nn.Module):
 
         return d1, d2, d3, poses_x2
 
-
-
-
 class TriDepthModel():
     def __init__(self,model,name='tridepth'):
         self.model,self.name = model,name
@@ -113,24 +112,29 @@ class Offset(nn.Module):
     '''
     def __init__(self):
         super().__init__()
-        self.register_buffer('o', torch.zeros([1,1]))
-        self.register_buffer('eye', torch.eyes(3).unsqueeze())
+        #self.o= torch.zeros([1,1]).type(torch.FloatTensor)
+        #self.eye=torch.eye(3).unsqueeze(0).type(torch.FloatTensor)
+        self.register_buffer('o', torch.zeros([1,1]).type(torch.FloatTensor))
+        self.register_buffer('eye', torch.eye(3).type(torch.FloatTensor).unsqueeze(0))
 
     def factorize(self, vecs, dim):
         mags = vecs.norm(p=2, dim=dim, keepdim=True)
-        return vecs/mag, mags
+        return vecs/mags, mags
 
     def rot_vec2mat(self, rot_vecs):
         batch, _ = rot_vecs.size()
-        directs, angles = self.factorize(vecs, 1)
+        directs, angles = self.factorize(rot_vecs, 1)
         
         K0 = directs[:,:1]
-        K1 = directs[:,:2]
+        K1 = directs[:,1:2]
         K2 = directs[:,2:]
         
-        o = self.o.repeat(batch, dim=0)
-        eye = self.eye.repeat(batch, dim=0)
-        K = torch.cat([o, -K2, K1, K2, o, K0, -K1, K0, o]).view(-1, 3, 3)
+        o = V(self.o.repeat(batch, 1))
+        eye = V(self.eye.repeat(batch, 1, 1))
+        
+        #print(K0.type, K2.type, K1.type, o.type, eye.type)
+        angles = angles.unsqueeze(-1)
+        K = torch.cat((o, -K2, K1, K2, o, K0, -K1, K0, o), 1).view(-1, 3, 3)
         return eye + K * angles.sin() + torch.bmm(K,K) * (1-angles.cos())
     
     def forward(self, pose, inv_depth):
@@ -139,9 +143,10 @@ class Offset(nn.Module):
 
         rot_mats = self.rot_vec2mat(rot_vecs)
 
-        offset_xyz = torch.matmul(rot_mats[:, :2].unsqueeze(1).unsqueeze(2), xy.unsqueeze(-1)).squeeze(-1) +
-            rot_mats[:, 2:] +
-            tran_vecs.view( *(tran_vecs.size()), 1, 1)  * inv_depth       
+        x, y = torch.meshgrid([torch.arange(height), torch.arange(width)])
+        xy = torch.stack([x, y], dim=0).expand(batch, 1, height, width)
+        
+        offset_xyz = torch.matmul(rot_mats[:, :2].unsqueeze(1).unsqueeze(2), xy.unsqueeze(-1)).squeeze(-1) + rot_mats[:, 2:] + tran_vecs.view(*(tran_vecs.size()), 1, 1)  * inv_depth       
         offset = offset_xyz[:, :2] / offset_xyz[:, 2]
         return offset
 
@@ -169,8 +174,8 @@ class BilinearProj(nn.Module):
 
 class TriAppearanceLoss(nn.Module):
     def __init__(self, scale=0.01, ws=11):
-
-        self.offset= Offset()
+        super().__init__()
+        self.offset = Offset()
         self.sampler = BilinearProj()
 
         self.SSIM = SSIM(window_size = ws)
@@ -179,8 +184,8 @@ class TriAppearanceLoss(nn.Module):
 
     def forward(self, d1, d3, poses_x2, x1, x2, x3):
 
-        offset1 = self.offset.forward( d1, poses_x2[:,0])
-        offset3 = self.offset.forward( d3, poses_x2[:,1])
+        offset1 = self.offset.forward(pose = poses_x2[:,0], inv_depth= d1)
+        offset3 = self.offset.forward(pose = poses_x2[:,1], inv_depth= d3)
 
         x12 = self.sampler.forward(x1, offset1)
         x32 = self.sampler.forward(x3, offset3)
@@ -190,6 +195,15 @@ class TriAppearanceLoss(nn.Module):
 
         return ssimloss + scale * l1loss
 
+class SmoothLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.laplacian = LaplacianLayer()
+    
+    def forward(self, x):
+        return self.laplacian(x).mean()
+    
+    
 class LaplacianLayer(nn.Module):
     def __init__(self):
         super(LaplacianLayer, self).__init__()
