@@ -12,3 +12,4 @@ __pycache__/*
 pytorch_ssim/*
 *.pyc
 fastai
+KITTI
