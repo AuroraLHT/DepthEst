@@ -1,0 +1,40 @@
+What the hell I have been struggled with.
+
+Digging Into Self-Supervised Monocular Depth Estimation
+https://arxiv.org/pdf/1806.01260.pdf
+
+Unsupervised Learning of Depth and Ego-Motion from Video
+https://people.eecs.berkeley.edu/~tinghuiz/projects/SfMLearner/cvpr17_sfm_final.pdf
+
+Monodepth
+https://github.com/mrharicot/monodepth
+
+SfMLeanrner
+https://github.com/tinghuiz/SfMLearner
+
+
+ "Real-Time Monocular Depth Estimation using Synthetic Data with Domain Adaptation via Image Style Transfer". demo video
+https://vimeo.com/260393753
+
+Image Quality Assessment: From Error Visibility to
+Structural Similarity
+http://www.cns.nyu.edu/pub/lcv/wang03-preprint.pdf
+
+Loss Functions for Image Restoration with Neural Networks
+https://arxiv.org/pdf/1511.08861.pdf
+
+epth from Monocular Videos using Direct Methods
+https://arxiv.org/pdf/1712.00175.pdf
+
+Spatial Transformer Networks
+https://papers.nips.cc/paper/5854-spatial-transformer-networks.pdf
+
+Unsupervised CNN for Single View Depth
+Estimation: Geometry to the Rescue
+https://arxiv.org/pdf/1603.04992.pdf
+
+Unsupervised Monocular Depth Estimation with Left-Right Consistency
+https://arxiv.org/pdf/1609.03677.pdf
+
+pytorch-ssim
+https://github.com/Po-Hsun-Su/pytorch-ssim

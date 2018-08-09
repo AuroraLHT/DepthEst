@@ -162,6 +162,9 @@ class Offset(nn.Module):
         """
         batch, c, h, w = inv_depth.size()
 
+        cxy = camera[:, 2:].view(batch, 2, 1, 1)
+        fxy = camera[:, :2].view(batch, 2, 1, 1)
+
         rot_vecs = pose[:,:3]
         tran_vecs = pose[:, 3:]
 
@@ -170,10 +173,12 @@ class Offset(nn.Module):
         # grip points preperation
         kx, ky = V(meshgrid_fromHW(h, w))
         kx, ky = kx.type_as(inv_depth)+0.5, ky.type_as(inv_depth)+0.5
-        x = (kx - camera[:,2]) / camera[:,0]
-        y = (ky - camera[:,3]) / camera[:,1]
+        #x = (kx - camera[:,2]) / camera[:,0]
+        #y = (ky - camera[:,3]) / camera[:,1]
         xy = torch.stack([x, y], dim=-1).expand(batch, height, width, 2)
         
+        xy = (xy - cxy)/fxy
+
         # transformation : Output Size NX3XHXW 
         # calculate the transformed extended homogenerous coordinate(in projective space) of the camera screen
         homo_xyz = (torch.matmul(rot_mats[:, :, :2].unsqueeze(1).unsqueeze(2), xy.unsqueeze(-1)).squeeze(-1).permute(0,3,1,2)
@@ -183,8 +188,10 @@ class Offset(nn.Module):
         # project the pixel in "tilted" projective space to projective space       
         xy_warp = offset_xyz[:, :2] / offset_xyz[:, 2:].clamp(min=1e-5)
         # projective space to camera space
-        tkx = ( xy_warp[:, 0] * camera[:,0] + camera[:,2] ) #- cx.expand(batch, height, width) 
-        tky = ( xy_warp[:, 1] * camera[:,1] + camera[:,3] ) #- cy.expand(batch, heigh, width)
+        xy_warp = (xy_warp * fxy) + cxy
+        tkx, tky = xy_warp[:, 0], xy_warp[:, 1]
+        #tkx = ( xy_warp[:, 0] * fxy[:,0] + cxy[:,2] ) #- kx.expand(batch, height, width) 
+        #tky = ( xy_warp[:, 1] * fxy[:,1] + cxy[:,3] ) #- ky.expand(batch, heigh, width)
 
         dmask = V(offset_xyz[:, 2:]<1e-5)
 
