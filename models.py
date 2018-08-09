@@ -252,3 +252,49 @@ class TriAppearanceLoss(nn.Module):
         l1loss = self.L1(x12, x2m12) + self.L1(x32, x2m32)
 
         return ssimlossAS
+
+
+class SmoothLoss(nn.Module):
+    def __init__(self):
+        self.laplacian = LaplacianLayer()
+
+    def forward(self, imgs):
+        return self.laplacian(imgs).mean()
+
+class LaplacianLayer(nn.Module):
+    def __init__(self):
+        super(LaplacianLayer, self).__init__()
+        w_nom = torch.FloatTensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]]).view(1,1,3,3)
+        w_den = torch.FloatTensor([[0, 1, 0], [1, 4, 1], [0, 1, 0]]).view(1,1,3,3)
+        self.register_buffer('w_nom', w_nom)
+        self.register_buffer('w_den', w_den)
+
+    def forward(self, input, do_normalize=True):
+        assert(input.dim() == 2 or input.dim()==3 or input.dim()==4)
+        input_size = input.size()
+        if input.dim()==4:
+            x = input.view(input_size[0]*input_size[1], 1,
+                            input_size[2], input_size[3])
+        elif input.dim()==3:
+            x = input.unsqueeze(1)
+        else:
+            x = input.unsqueeze(0).unsqueeze(0)
+        x_nom = torch.nn.functional.conv2d(input=x,
+                        weight=Variable(self.w_nom),
+                        stride=1,
+                        padding=0)
+        if do_normalize:
+            x_den = torch.nn.functional.conv2d(input=x,
+                        weight=Variable(self.w_den),
+                        stride=1,
+                        padding=0)
+            # x_den = x.std() + 1e-5
+            x = (x_nom.abs()/x_den)
+        else:
+            x = x_nom.abs()
+        if input.dim() == 4:
+            return x.view(input_size[0], input_size[1], input_size[2]-2, input_size[3]-2)
+        elif input.dim() == 3:
+            return x.squeeze(1)
+        elif input.dim() == 2:
+            return x.squeeze(0).squeeze(0)
