@@ -16,7 +16,7 @@ cut,lr_cut = model_meta[f]
 def meshgrid_fromHW(H, W):
     x = torch.arange(W)
     y = torch.arange(H)
-    return meshgrid(H, W)
+    return meshgrid(x, y)
 
 def meshgrid(x ,y):
     imW = x.size(0)
@@ -154,7 +154,7 @@ class Offset(nn.Module):
                     1-3 is the transition vector
                     4-6 is the rotation vector
                 inv_depth: invered depth map
-                camera: intrinsic camera parameters: (fx, fy, cx, cy)
+                camera: intrinsic camera parameters NX4: (fx, fy, cx, cy)
             Return:
                 tkx: transformed camera pixel points - x-component
                 tky: transformed camera pixel points - y-component
@@ -168,10 +168,10 @@ class Offset(nn.Module):
         rot_mats = self.rot_vec2mat(rot_vecs)
 
         # grip points preperation
-        kx, ky = V(meshgrid_fromHW(h, w)).type_as(inv_depth)
-        kx, ky = cx+0.5, cy+0.5
-        x = (kx -camera['cx']) / camera['fx']
-        y = (ky -camera['cy']) / camera['fy']
+        kx, ky = V(meshgrid_fromHW(h, w))
+        kx, ky = kx.type_as(inv_depth)+0.5, ky.type_as(inv_depth)+0.5
+        x = (kx - camera[:,2]) / camera[:,0]
+        y = (ky - camera[:,3]) / camera[:,1]
         xy = torch.stack([x, y], dim=-1).expand(batch, height, width, 2)
         
         # transformation : Output Size NX3XHXW 
@@ -183,8 +183,8 @@ class Offset(nn.Module):
         # project the pixel in "tilted" projective space to projective space       
         xy_warp = offset_xyz[:, :2] / offset_xyz[:, 2:].clamp(min=1e-5)
         # projective space to camera space
-        tkx = ( xy_warp[:, 0] * camera['fx'] + camera['cx'] ) #- cx.expand(batch, height, width) 
-        tky = ( xy_warp[:, 1] * camera['fy'] + camera['cy'] ) #- cy.expand(batch, heigh, width)
+        tkx = ( xy_warp[:, 0] * camera[:,0] + camera[:,2] ) #- cx.expand(batch, height, width) 
+        tky = ( xy_warp[:, 1] * camera[:,1] + camera[:,3] ) #- cy.expand(batch, heigh, width)
 
         dmask = V(offset_xyz[:, 2:]<1e-5)
 
@@ -232,10 +232,10 @@ class TriAppearanceLoss(nn.Module):
         self.L1 = nn.L1Loss()
         self.scale = scale
 
-    def forward(self, d1, d3, poses_x2, x1, x2, x3):
+    def forward(self, d1, d3, poses_x2, x1, x2, x3, camera):
 
-        cx12, cy12, d_mask12,  = self.offset.forward(pose = poses_x2[:,0], inv_depth= d1)
-        cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth= d3)
+        cx12, cy12, d_mask12,  = self.offset.forward(pose = poses_x2[:,0], inv_depth= d1, camera=camera)
+        cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth= d3, camera=camera)
 
         x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
         x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
@@ -256,6 +256,7 @@ class TriAppearanceLoss(nn.Module):
 
 class SmoothLoss(nn.Module):
     def __init__(self):
+        super().__init__()
         self.laplacian = LaplacianLayer()
 
     def forward(self, imgs):
