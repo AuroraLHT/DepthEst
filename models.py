@@ -162,8 +162,8 @@ class Offset(nn.Module):
         """
         batch, c, h, w = inv_depth.size()
 
-        cxy = camera[:, 2:].view(batch, 2, 1, 1)
-        fxy = camera[:, :2].view(batch, 2, 1, 1)
+        cxy = camera[:, 2:].contiguous().view(batch, 1, 1, 2)
+        fxy = camera[:, :2].contiguous().view(batch, 1, 1, 2)
 
         rot_vecs = pose[:,:3]
         tran_vecs = pose[:, 3:]
@@ -175,25 +175,29 @@ class Offset(nn.Module):
         kx, ky = kx.type_as(inv_depth)+0.5, ky.type_as(inv_depth)+0.5
         #x = (kx - camera[:,2]) / camera[:,0]
         #y = (ky - camera[:,3]) / camera[:,1]
-        xy = torch.stack([x, y], dim=-1).expand(batch, height, width, 2)
+        kxy = torch.stack([kx, ky], dim=-1).repeat(batch, 1, 1, 1)
         
-        xy = (xy - cxy)/fxy
+        hxy = (kxy - cxy)/fxy
 
         # transformation : Output Size NX3XHXW 
         # calculate the transformed extended homogenerous coordinate(in projective space) of the camera screen
-        homo_xyz = (torch.matmul(rot_mats[:, :, :2].unsqueeze(1).unsqueeze(2), xy.unsqueeze(-1)).squeeze(-1).permute(0,3,1,2)
-         + rot_mats[:, :, 2:].unsqueeze(-1) 
-         + tran_vecs.view(*(tran_vecs.size()), 1, 1)  * inv_depth
-        )
+        thxyz = torch.matmul(rot_mats[:, :, :2].unsqueeze(1).unsqueeze(2), hxy.unsqueeze(-1)).squeeze(-1).permute(0,3,1,2)
+        thxyz = thxyz + rot_mats[:, :, 2].unsqueeze(-1).unsqueeze(-1) 
+        thxyz = thxyz + tran_vecs.unsqueeze(-1).unsqueeze(-1) * inv_depth
+        
         # project the pixel in "tilted" projective space to projective space       
-        xy_warp = offset_xyz[:, :2] / offset_xyz[:, 2:].clamp(min=1e-5)
+        thxy_warp = thxyz[:, :2] / thxyz[:, 2:].clamp(min=1e-5)
+        
         # projective space to camera space
-        xy_warp = (xy_warp * fxy) + cxy
-        tkx, tky = xy_warp[:, 0], xy_warp[:, 1]
+        cxy = cxy.view(batch, 2, 1, 1)
+        fxy = fxy.view(batch, 2, 1, 1)
+        
+        tkxy = (thxy_warp * fxy) + cxy
+        tkx, tky = tkxy[:, 0], tkxy[:, 1]
         #tkx = ( xy_warp[:, 0] * fxy[:,0] + cxy[:,2] ) #- kx.expand(batch, height, width) 
         #tky = ( xy_warp[:, 1] * fxy[:,1] + cxy[:,3] ) #- ky.expand(batch, heigh, width)
 
-        dmask = V(offset_xyz[:, 2:]<1e-5)
+        dmask = (thxyz[:, 2]<1e-5).type_as(inv_depth)
 
         return tkx, tky, dmask
 
@@ -217,16 +221,16 @@ class BilinearProj(nn.Module):
                 sampled : sampled image from imgs
                 in_view_mask : binary masks show whether the pixel is out of boundary
         """
-        batch, c, height , width = imgs.size()
+        batch, c, h , w = imgs.size()
 
         # n_kx stands for normalized camera points x component, range from (-1, 1)       
-        n_kx = kx/((height-1)/2) - 1
-        n_ky = ky/((width-1)/2) - 1
+        n_kx = kx/((h-1)/2) - 1
+        n_ky = ky/((w-1)/2) - 1
         # shape of rcxy should be B X H X W X 2
         n_kxy = torch.stack([n_kx, n_ky], dim=-1)
         
         sampled = F.grid_sample(imgs, n_kxy, mode='bilinear', padding_mode='border')  
-        in_view_mask = Variable(((n_kx.data > -1+2/w) & (n_kx.data < 1-2/w) & (n_ky.data > -1+2/h) & (n_ky.data < 1-2/h)).type_as(imgs.data))
+        in_view_mask = V(((n_kx.data > -1+2/w) & (n_kx.data < 1-2/w) & (n_ky.data > -1+2/h) & (n_ky.data < 1-2/h)).type_as(imgs.data))
         return sampled, in_view_mask
 
 class TriAppearanceLoss(nn.Module):
@@ -236,7 +240,7 @@ class TriAppearanceLoss(nn.Module):
         self.sampler = BilinearProj()
 
         self.SSIM = SSIM(window_size = ws)
-        self.L1 = nn.L1Loss()
+        #self.L1 = nn.L1Loss()
         self.scale = scale
 
     def forward(self, d1, d3, poses_x2, x1, x2, x3, camera):
@@ -246,19 +250,22 @@ class TriAppearanceLoss(nn.Module):
 
         x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
         x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
-
-        mask12 = (d_mask12*in_mask12)
-        mask32 = (d_mask32*in_mask32)
-
+        
+        mask12 = (d_mask12*in_mask12).unsqueeze(1)
+        mask32 = (d_mask32*in_mask32).unsqueeze(1)
+        
         x12 = mask12 * x12
         x32 = mask32 * x32
         x2m12 = mask12 * x2
         x2m32 = mask32 * x2
 
+        #print(type(x12))
+        #print(type(x2m12))
+        
         ssimloss = self.SSIM(x12, x2m12) + self.SSIM(x32, x2m32)
-        l1loss = self.L1(x12, x2m12) + self.L1(x32, x2m32)
+        l1loss = F.l1_loss(x12, x2m12) + F.l1_loss(x32, x2m32)
 
-        return ssimlossAS
+        return ssimloss + self.scale + l1loss
 
 
 class SmoothLoss(nn.Module):
