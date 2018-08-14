@@ -13,10 +13,15 @@ from fastai.conv_learner import *
 f = resnet34
 cut,lr_cut = model_meta[f]
 
-def meshgrid_fromHW(H, W):
+def meshgrid_fromHW(H, W, dtype=torch.FloatTensor):
+    x = torch.arange(W).type(dtype)
+    y = torch.arange(H).type(dtype)
+    return meshgrid(x, y)
+
+def xy_fromHW(H, W):
     x = torch.arange(W)
     y = torch.arange(H)
-    return meshgrid(x, y)
+    return x, y
 
 def meshgrid(x ,y):
     imW = x.size(0)
@@ -74,10 +79,16 @@ class Depth34(nn.Module):
         self.rn = rn
         self.sfs = [SaveFeatures(rn[i]) for i in [2,4,5,6]]
         self.up1 = UnetBlock(512,256,256)
-        self.up2 = UnetBlock(256,128,256)
-        self.up3 = UnetBlock(256,64,256)
-        self.up4 = UnetBlock(256,64,256)
-        self.up5 = UnetBlock(256,3,16)
+        self.up2 = UnetBlock(256,128,128)
+        self.up3 = UnetBlock(128,64,64)
+        self.up4 = UnetBlock(64,64,64)
+        self.up5 = UnetBlock(64,3,16)
+
+#         self.up1 = UnetBlock(512,256,256)
+#         self.up2 = UnetBlock(256,128,256)
+#         self.up3 = UnetBlock(256,64,256)
+#         self.up4 = UnetBlock(256,64,256)
+#         self.up5 = UnetBlock(256,3,16)
         self.up6 = nn.ConvTranspose2d(16, ochannel, 1)
         
     def forward(self,x):
@@ -148,6 +159,7 @@ class Offset(nn.Module):
         return eye + K * angles.sin() + torch.bmm(K,K) * (1-angles.cos()) # using the R formular
     
     def forward(self, pose, inv_depth, camera):
+        camera = camera.data
         """
             Params:
                 pose: relative pose, N X 6 vectors,
@@ -171,14 +183,13 @@ class Offset(nn.Module):
         rot_mats = self.rot_vec2mat(rot_vecs)
 
         # grip points preperation
-        kx, ky = V(meshgrid_fromHW(h, w))
-        kx, ky = kx.type_as(inv_depth)+0.5, ky.type_as(inv_depth)+0.5
-        #x = (kx - camera[:,2]) / camera[:,0]
-        #y = (ky - camera[:,3]) / camera[:,1]
+        kx, ky = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
+        kx, ky = kx+0.5, ky+0.5
         kxy = torch.stack([kx, ky], dim=-1).repeat(batch, 1, 1, 1)
         
         hxy = (kxy - cxy)/fxy
-
+        
+        hxy = V(hxy)
         # transformation : Output Size NX3XHXW 
         # calculate the transformed extended homogenerous coordinate(in projective space) of the camera screen
         thxyz = torch.matmul(rot_mats[:, :, :2].unsqueeze(1).unsqueeze(2), hxy.unsqueeze(-1)).squeeze(-1).permute(0,3,1,2)
@@ -189,15 +200,15 @@ class Offset(nn.Module):
         thxy_warp = thxyz[:, :2] / thxyz[:, 2:].clamp(min=1e-5)
         
         # projective space to camera space
-        cxy = cxy.view(batch, 2, 1, 1)
-        fxy = fxy.view(batch, 2, 1, 1)
+        cxy = V(cxy.view(batch, 2, 1, 1))
+        fxy = V(fxy.view(batch, 2, 1, 1))
         
         tkxy = (thxy_warp * fxy) + cxy
         tkx, tky = tkxy[:, 0], tkxy[:, 1]
         #tkx = ( xy_warp[:, 0] * fxy[:,0] + cxy[:,2] ) #- kx.expand(batch, height, width) 
         #tky = ( xy_warp[:, 1] * fxy[:,1] + cxy[:,3] ) #- ky.expand(batch, heigh, width)
 
-        dmask = V(thxyz[:, 2]<1e-5)
+        dmask = V((thxyz[:, 2].data<1e-5).type_as(inv_depth.data))
 
         return tkx, tky, dmask
 
@@ -229,12 +240,12 @@ class BilinearProj(nn.Module):
         # shape of rcxy should be B X H X W X 2
         n_kxy = torch.stack([n_kx, n_ky], dim=-1)
         
-        sampled = F.grid_sample(imgs, n_kxy, mode='bilinear', padding_mode='border')  
+        sampled = F.grid_sample(imgs, n_kxy, mode='bilinear')  
         in_view_mask = V(((n_kx.data > -1+2/w) & (n_kx.data < 1-2/w) & (n_ky.data > -1+2/h) & (n_ky.data < 1-2/h)).type_as(imgs.data))
         return sampled, in_view_mask
 
 class TriAppearanceLoss(nn.Module):
-    def __init__(self, scale=0.01, ws=11):
+    def __init__(self, scale=0.5, ws=11):
         super().__init__()
         self.offset = Offset()
         self.sampler = BilinearProj()
@@ -245,7 +256,7 @@ class TriAppearanceLoss(nn.Module):
 
     def forward(self, d1, d3, poses_x2, x1, x2, x3, camera):
 
-        cx12, cy12, d_mask12,  = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
+        cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
         cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
 
         x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
@@ -254,18 +265,17 @@ class TriAppearanceLoss(nn.Module):
         mask12 = (d_mask12*in_mask12).unsqueeze(1)
         mask32 = (d_mask32*in_mask32).unsqueeze(1)
         
-        x12 = mask12 * x12
-        x32 = mask32 * x32
-        x2m12 = mask12 * x2
-        x2m32 = mask32 * x2
-
+        mask12.require_grad = False
+        mask32.require_grad = False
+        
         #print(type(x12))
         #print(type(x2m12))
         
-        ssimloss = self.SSIM(x12, x2m12) + self.SSIM(x32, x2m32)
-        l1loss = F.l1_loss(x12, x2m12) + F.l1_loss(x32, x2m32)
+        ssimloss = self.SSIM(x12, x2) + self.SSIM(x32, x2)
+        #ssimloss = self.SSIM(mask12 * x12, mask12 * x2) + self.SSIM(mask32 * x32, mask32 * x2)
+        l1loss = F.l1_loss(x12, x2) + F.l1_loss(x32, x2)
 
-        return ssimloss + self.scale + l1loss
+        return ssimloss + self.scale * l1loss, (ssimloss, l1loss)
 
 
 class SmoothLoss(nn.Module):
@@ -283,33 +293,61 @@ class LaplacianLayer(nn.Module):
         w_den = torch.FloatTensor([[0, 1, 0], [1, 4, 1], [0, 1, 0]]).view(1,1,3,3)
         self.register_buffer('w_nom', w_nom)
         self.register_buffer('w_den', w_den)
-
+        
     def forward(self, input, do_normalize=True):
         assert(input.dim() == 2 or input.dim()==3 or input.dim()==4)
         input_size = input.size()
-        if input.dim()==4:
-            x = input.view(input_size[0]*input_size[1], 1,
-                            input_size[2], input_size[3])
-        elif input.dim()==3:
-            x = input.unsqueeze(1)
-        else:
-            x = input.unsqueeze(0).unsqueeze(0)
-        x_nom = torch.nn.functional.conv2d(input=x,
-                        weight=Variable(self.w_nom),
-                        stride=1,
-                        padding=0)
+
+        x = input.view(input_size[0]*input_size[1], 1, input_size[2], input_size[3])
+        x_nom = F.conv2d(
+            input=x,
+            weight=V(self.w_nom),
+            stride=1,
+            padding=0
+        )
         if do_normalize:
-            x_den = torch.nn.functional.conv2d(input=x,
-                        weight=Variable(self.w_den),
-                        stride=1,
-                        padding=0)
+            x_den = F.conv2d(
+                input=x,
+                weight=V(self.w_den),
+                stride=1,
+                padding=0
+            )
+            
             # x_den = x.std() + 1e-5
+            
             x = (x_nom.abs()/x_den)
         else:
             x = x_nom.abs()
-        if input.dim() == 4:
-            return x.view(input_size[0], input_size[1], input_size[2]-2, input_size[3]-2)
-        elif input.dim() == 3:
-            return x.squeeze(1)
-        elif input.dim() == 2:
-            return x.squeeze(0).squeeze(0)
+            
+        return x.view(input_size[0], input_size[1], input_size[2]-2, input_size[3]-2)
+
+        
+#     def forward(self, input, do_normalize=True):
+#         assert(input.dim() == 2 or input.dim()==3 or input.dim()==4)
+#         input_size = input.size()
+#         if input.dim()==4:
+#             x = input.view(input_size[0]*input_size[1], 1,
+#                             input_size[2], input_size[3])
+#         elif input.dim()==3:
+#             x = input.unsqueeze(1)
+#         else:
+#             x = input.unsqueeze(0).unsqueeze(0)
+#         x_nom = torch.nn.functional.conv2d(input=x,
+#                         weight=Variable(self.w_nom),
+#                         stride=1,
+#                         padding=0)
+#         if do_normalize:
+#             x_den = torch.nn.functional.conv2d(input=x,
+#                         weight=Variable(self.w_den),
+#                         stride=1,
+#                         padding=0)
+#             # x_den = x.std() + 1e-5
+#             x = (x_nom.abs()/x_den)
+#         else:
+#             x = x_nom.abs()
+#         if input.dim() == 4:
+#             return x.view(input_size[0], input_size[1], input_size[2]-2, input_size[3]-2)
+#         elif input.dim() == 3:
+#             return x.squeeze(1)
+#         elif input.dim() == 2:
+#             return x.squeeze(0).squeeze(0)
