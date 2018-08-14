@@ -56,11 +56,11 @@ class Pose(nn.Module):
         self.ps = 6
         self.multi = 2
         self.body = nn.Sequential(
-            nn.Conv2d(inc, 256, 3),
+            nn.Conv2d(inc, 128, 3),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, 3),
+            nn.Conv2d(128, 128, 3),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, self.ps*self.multi, 3),
+            nn.Conv2d(128, self.ps*self.multi, 3),
             nn.AdaptiveAvgPool2d((1,1))
         )
     def forward(self, x):
@@ -197,7 +197,7 @@ class Offset(nn.Module):
         #tkx = ( xy_warp[:, 0] * fxy[:,0] + cxy[:,2] ) #- kx.expand(batch, height, width) 
         #tky = ( xy_warp[:, 1] * fxy[:,1] + cxy[:,3] ) #- ky.expand(batch, heigh, width)
 
-        dmask = (thxyz[:, 2]<1e-5).type_as(inv_depth)
+        dmask = V(thxyz[:, 2]<1e-5)
 
         return tkx, tky, dmask
 
@@ -245,8 +245,8 @@ class TriAppearanceLoss(nn.Module):
 
     def forward(self, d1, d3, poses_x2, x1, x2, x3, camera):
 
-        cx12, cy12, d_mask12,  = self.offset.forward(pose = poses_x2[:,0], inv_depth= d1, camera=camera)
-        cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth= d3, camera=camera)
+        cx12, cy12, d_mask12,  = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
+        cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
 
         x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
         x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
