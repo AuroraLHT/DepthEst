@@ -41,6 +41,7 @@ class SaveFeatures():
     def hook_fn(self, module, input, output): self.features = output
     def remove(self): self.hook.remove()
 
+"""
 class UnetBlock(nn.Module):
     def __init__(self, up_in, x_in, n_out):
         super().__init__()
@@ -48,18 +49,34 @@ class UnetBlock(nn.Module):
         self.x_conv  = nn.Conv2d(x_in,  x_out,  1)
         self.tr_conv = nn.ConvTranspose2d(up_in, up_out, 2, stride=2)
         self.bn = nn.BatchNorm2d(n_out)
-        
+
     def forward(self, up_p, x_p):
         up_p = self.tr_conv(up_p)
         x_p = self.x_conv(x_p)
         cat_p = torch.cat([up_p,x_p], dim=1)
         return self.bn(F.relu(cat_p))
+"""
+class UnetBlock(nn.Module):
+    def __init__(self, up_in, x_in, n_out):
+        super().__init__()
+        up_out = x_out = n_out//2
+        self.x_conv = nn.Conv2d(x_in, x_out, 1)
+        self.tr_conv = nn.ConvTranspose2d(up_in, up_out, 2, bias=True, stride=2, padding=0)
+        #self.bn = nn.BatchNorm2d(n_out)
+        self.activation = nn.ELU()
 
+    def forward(self, up_p, x_p):
+        up_p = self.activation(self.tr_conv(up_p))
+        x_p = self.x_conv(x_p)
+        return torch.cat([up_p,x_p], dim=1)
+        
 class Pose(nn.Module):
     def __init__(self, inc):
         super().__init__()
         self.ps = 6
         self.multi = 2
+        self.mag_scalor = 0.01
+
         self.body = nn.Sequential(
             nn.Conv2d(inc, 128, 3),
             nn.ReLU(inplace=True),
@@ -71,7 +88,7 @@ class Pose(nn.Module):
     def forward(self, x):
         x = self.body(x)
         batch, c, h, w = x.size()
-        return x.view(batch, self.multi, self.ps)
+        return x.view(batch, self.multi, self.ps) * self.mag_scalor
 
 class Depth34(nn.Module):
     def __init__(self, rn, ochannel):
@@ -208,9 +225,9 @@ class Offset(nn.Module):
         #tkx = ( xy_warp[:, 0] * fxy[:,0] + cxy[:,2] ) #- kx.expand(batch, height, width) 
         #tky = ( xy_warp[:, 1] * fxy[:,1] + cxy[:,3] ) #- ky.expand(batch, heigh, width)
 
-        dmask = V((thxyz[:, 2].data<1e-5).type_as(inv_depth.data))
+        #dmask = V((thxyz[:, 2].data<1e-5).type_as(inv_depth.data))
 
-        return tkx, tky, dmask
+        return tkx, tky #, dmask
 
 class BilinearProj(nn.Module):
     """
@@ -241,8 +258,8 @@ class BilinearProj(nn.Module):
         n_kxy = torch.stack([n_kx, n_ky], dim=-1)
         
         sampled = F.grid_sample(imgs, n_kxy, mode='bilinear')  
-        in_view_mask = V(((n_kx.data > -1+2/w) & (n_kx.data < 1-2/w) & (n_ky.data > -1+2/h) & (n_ky.data < 1-2/h)).type_as(imgs.data))
-        return sampled, in_view_mask
+        #in_view_mask = V(((n_kx.data > -1+2/w) & (n_kx.data < 1-2/w) & (n_ky.data > -1+2/h) & (n_ky.data < 1-2/h)).type_as(imgs.data))
+        return sampled #, in_view_mask
 
 class TriAppearanceLoss(nn.Module):
     def __init__(self, scale=0.5, ws=11):
@@ -256,23 +273,27 @@ class TriAppearanceLoss(nn.Module):
 
     def forward(self, d1, d3, poses_x2, x1, x2, x3, camera):
 
-        cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
-        cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
+        # cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
+        # cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
+        cx12, cy12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
+        cx32, cy32= self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
 
-        x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
-        x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
+        x12 = self.sampler.forward(x1, cx12, cy12)
+        x32 = self.sampler.forward(x3, cx32, cy32)
         
-        mask12 = (d_mask12*in_mask12).unsqueeze(1)
-        mask32 = (d_mask32*in_mask32).unsqueeze(1)
+        #x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
+        #x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
         
-        mask12.require_grad = False
-        mask32.require_grad = False
+        #mask12 = (d_mask12*in_mask12).unsqueeze(1)
+        #mask32 = (d_mask32*in_mask32).unsqueeze(1)
+        
+        #mask12.requires_grad = False
+        #mask32.requires_grad = False
         
         #print(type(x12))
         #print(type(x2m12))
         
         ssimloss = self.SSIM(x12, x2) + self.SSIM(x32, x2)
-        #ssimloss = self.SSIM(mask12 * x12, mask12 * x2) + self.SSIM(mask32 * x32, mask32 * x2)
         l1loss = F.l1_loss(x12, x2) + F.l1_loss(x32, x2)
 
         return ssimloss + self.scale * l1loss, (ssimloss, l1loss)
@@ -283,8 +304,11 @@ class SmoothLoss(nn.Module):
         super().__init__()
         self.laplacian = LaplacianLayer()
 
-    def forward(self, imgs):
-        return self.laplacian(imgs).mean()
+    def forward(self, imgs, masks=None):
+        if masks is not None:
+            return (masks * self.laplacian(imgs))
+        else:
+            return self.laplacian(imgs).mean()
 
 class LaplacianLayer(nn.Module):
     def __init__(self):
