@@ -256,8 +256,8 @@ class BilinearProj(nn.Module):
         batch, c, h , w = imgs.size()
 
         # n_kx stands for normalized camera points x component, range from (-1, 1)       
-        n_kx = kx/((h-1)/2) - 1
-        n_ky = ky/((w-1)/2) - 1
+        n_kx = kx/((w-1)/2) - 1
+        n_ky = ky/((h-1)/2) - 1
         # shape of rcxy should be B X H X W X 2
         n_kxy = torch.stack([n_kx, n_ky], dim=-1)
         
