@@ -10,6 +10,7 @@ from fastai.conv_learner import *
 # part of architecture is copied from fastai library
 
 # transfer learning from pretrain resnet34
+EPS = 1e-10
 f = resnet34
 cut,lr_cut = model_meta[f]
 
@@ -78,11 +79,11 @@ class Pose(nn.Module):
         self.mag_scalor = 0.01
 
         self.body = nn.Sequential(
-            nn.Conv2d(inc, 128, 3),
+            nn.Conv2d(inc, 128, 3, stride=2, padding=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3),
+            nn.Conv2d(128, 128, 3, stride=2, padding=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, self.ps*self.multi, 3),
+            nn.Conv2d(128, self.ps*self.multi, 3, bias=True),
             nn.AdaptiveAvgPool2d((1,1))
         )
     def forward(self, x):
@@ -99,8 +100,11 @@ class Depth34(nn.Module):
         self.up2 = UnetBlock(256,128,128)
         self.up3 = UnetBlock(128,64,64)
         self.up4 = UnetBlock(64,64,64)
-        self.up5 = UnetBlock(64,3,16)
-
+        #self.up5 = UnetBlock(64,3,16) # this layer would make the model just copying the stuff from the pixel level
+        self.up5 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(64,16,1)
+        )
 #         self.up1 = UnetBlock(512,256,256)
 #         self.up2 = UnetBlock(256,128,256)
 #         self.up3 = UnetBlock(256,64,256)
@@ -116,7 +120,8 @@ class Depth34(nn.Module):
         x = self.up2(x, self.sfs[2].features)
         x = self.up3(x, self.sfs[1].features)
         x = self.up4(x, self.sfs[0].features)
-        x = self.up5(x, inp)
+        x = self.up5(x)
+        #x = self.up5(x, inp)
         x = self.up6(x)
         return F.sigmoid(x), self.sfs[3].features
     
@@ -201,11 +206,10 @@ class Offset(nn.Module):
 
         # grip points preperation
         kx, ky = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
-        kx, ky = kx+0.5, ky+0.5
+        #kx, ky = kx+0.5, ky+0.5
         kxy = torch.stack([kx, ky], dim=-1).repeat(batch, 1, 1, 1)
         
         hxy = (kxy - cxy)/fxy
-        
         hxy = V(hxy)
         # transformation : Output Size NX3XHXW 
         # calculate the transformed extended homogenerous coordinate(in projective space) of the camera screen
@@ -214,7 +218,7 @@ class Offset(nn.Module):
         thxyz = thxyz + tran_vecs.unsqueeze(-1).unsqueeze(-1) * inv_depth
         
         # project the pixel in "tilted" projective space to projective space       
-        thxy_warp = thxyz[:, :2] / thxyz[:, 2:].clamp(min=1e-5)
+        thxy_warp = thxyz[:, :2] / thxyz[:, 2:].clamp(min=EPS)
         
         # projective space to camera space
         cxy = V(cxy.view(batch, 2, 1, 1))
@@ -225,7 +229,7 @@ class Offset(nn.Module):
         #tkx = ( xy_warp[:, 0] * fxy[:,0] + cxy[:,2] ) #- kx.expand(batch, height, width) 
         #tky = ( xy_warp[:, 1] * fxy[:,1] + cxy[:,3] ) #- ky.expand(batch, heigh, width)
 
-        #dmask = V((thxyz[:, 2].data<1e-5).type_as(inv_depth.data))
+        #dmask = V((thxyz[:, 2].data<EPS).type_as(inv_depth.data))
 
         return tkx, tky #, dmask
 
@@ -268,7 +272,6 @@ class TriAppearanceLoss(nn.Module):
         self.sampler = BilinearProj()
 
         self.SSIM = SSIM(window_size = ws)
-        #self.L1 = nn.L1Loss()
         self.scale = scale
 
     def forward(self, d1, d3, poses_x2, x1, x2, x3, camera):
@@ -293,10 +296,12 @@ class TriAppearanceLoss(nn.Module):
         #print(type(x12))
         #print(type(x2m12))
         
-        ssimloss = self.SSIM(x12, x2) + self.SSIM(x32, x2)
+        #ssimloss = self.SSIM(x12, x2) + self.SSIM(x32, x2)
+        l2loss = F.mse_loss(x12, x2) + F.mse_loss(x32, x2)
         l1loss = F.l1_loss(x12, x2) + F.l1_loss(x32, x2)
 
-        return ssimloss + self.scale * l1loss, (ssimloss, l1loss)
+        return l2loss + self.scale * l1loss, (l2loss, l1loss)
+        #return ssimloss + self.scale * l1loss, (ssimloss, l1loss)
 
 
 class SmoothLoss(nn.Module):
