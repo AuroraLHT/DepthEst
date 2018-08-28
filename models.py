@@ -42,12 +42,12 @@ class SaveFeatures():
     def hook_fn(self, module, input, output): self.features = output
     def remove(self): self.hook.remove()
 
-"""
+
 class UnetBlock(nn.Module):
     def __init__(self, up_in, x_in, n_out):
         super().__init__()
         up_out = x_out = n_out//2
-        self.x_conv  = nn.Conv2d(x_in,  x_out,  1)
+        self.x_conv  = nn.Conv2d(x_in,  x_out, 1)
         self.tr_conv = nn.ConvTranspose2d(up_in, up_out, 2, stride=2)
         self.bn = nn.BatchNorm2d(n_out)
 
@@ -70,18 +70,19 @@ class UnetBlock(nn.Module):
         up_p = self.activation(self.tr_conv(up_p))
         x_p = self.x_conv(x_p)
         return torch.cat([up_p,x_p], dim=1)
-        
+"""
+
 class Pose(nn.Module):
     def __init__(self, inc):
         super().__init__()
         self.ps = 6
         self.multi = 2
-        self.mag_scalor = 0.01
+        self.mag_scalor = .5
 
         self.body = nn.Sequential(
-            nn.Conv2d(inc, 128, 3, stride=2, padding=1, bias=True),
+            nn.Conv2d(inc, 128, 3, stride=1, padding=0, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, stride=2, padding=1, bias=True),
+            nn.Conv2d(128, 128, 3, stride=1, padding=0, bias=True),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, self.ps*self.multi, 3, bias=True),
             nn.AdaptiveAvgPool2d((1,1))
@@ -100,30 +101,39 @@ class Depth34(nn.Module):
         self.up2 = UnetBlock(256,128,128)
         self.up3 = UnetBlock(128,64,64)
         self.up4 = UnetBlock(64,64,64)
-        #self.up5 = UnetBlock(64,3,16) # this layer would make the model just copying the stuff from the pixel level
-        self.up5 = nn.Sequential(
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(64,16,1)
-        )
+        self.up5 = UnetBlock(64,3,16) # this layer would make the model just copying the stuff from the pixel level
+#         self.up5 = nn.Sequential(
+#            nn.Upsample(scale_factor=2),
+#            nn.ReflectionPad2d(1),
+#            nn.Conv2d(64,16,3),
+#         )
 #         self.up1 = UnetBlock(512,256,256)
 #         self.up2 = UnetBlock(256,128,256)
 #         self.up3 = UnetBlock(256,64,256)
 #         self.up4 = UnetBlock(256,64,256)
 #         self.up5 = UnetBlock(256,3,16)
-        self.up6 = nn.ConvTranspose2d(16, ochannel, 1)
         
+        self.up6 = nn.Conv2d(16, ochannel, 1, bias=False)    
+        #self.up6 = nn.ConvTranspose2d(16, ochannel, 1, bias=False)
+
+        self.op_norm = torch.nn.InstanceNorm2d(1)
+    
     def forward(self,x):
         inp = x
-        x = F.relu(self.rn(x))
+        x = F.elu(self.rn(x))
         
         x = self.up1(x, self.sfs[3].features)
         x = self.up2(x, self.sfs[2].features)
         x = self.up3(x, self.sfs[1].features)
         x = self.up4(x, self.sfs[0].features)
-        x = self.up5(x)
-        #x = self.up5(x, inp)
+#         x = self.up5(x)
+        x = self.up5(x, inp)
         x = self.up6(x)
-        return F.sigmoid(x), self.sfs[3].features
+        
+        return F.sigmoid(x), self.sfs[3].features #, x
+        #return F.sigmoid(self.op_norm(x)), self.sfs[3].features #, x
+        #return 1/torch.clamp(F.relu(x), 0.1, 500), self.sfs[3].features 
+        #return x, self.sfs[3].features 
     
     def close(self):
         for sf in self.sfs: sf.remove()
@@ -159,7 +169,7 @@ class Offset(nn.Module):
         super().__init__()
         self.register_buffer('o', torch.zeros([1,1]).type(torch.FloatTensor))
         self.register_buffer('eye', torch.eye(3).type(torch.FloatTensor).unsqueeze(0))
-
+        
     def factorize(self, vecs, dim):
         mags = vecs.norm(p=2, dim=dim, keepdim=True)
         return vecs/mags, mags
@@ -224,14 +234,13 @@ class Offset(nn.Module):
         cxy = V(cxy.view(batch, 2, 1, 1))
         fxy = V(fxy.view(batch, 2, 1, 1))
         
+        #tkxy = (thxy_warp * fxy) + cxy - V(kxy.permute(0,3,1,2))
         tkxy = (thxy_warp * fxy) + cxy
         tkx, tky = tkxy[:, 0], tkxy[:, 1]
-        #tkx = ( xy_warp[:, 0] * fxy[:,0] + cxy[:,2] ) #- kx.expand(batch, height, width) 
-        #tky = ( xy_warp[:, 1] * fxy[:,1] + cxy[:,3] ) #- ky.expand(batch, heigh, width)
 
-        #dmask = V((thxyz[:, 2].data<EPS).type_as(inv_depth.data))
+        dmask = V((thxyz[:, 2].data>EPS).type_as(inv_depth.data))
 
-        return tkx, tky #, dmask
+        return tkx, tky, dmask
 
 class BilinearProj(nn.Module):
     """
@@ -262,45 +271,101 @@ class BilinearProj(nn.Module):
         n_kxy = torch.stack([n_kx, n_ky], dim=-1)
         
         sampled = F.grid_sample(imgs, n_kxy, mode='bilinear')  
-        #in_view_mask = V(((n_kx.data > -1+2/w) & (n_kx.data < 1-2/w) & (n_ky.data > -1+2/h) & (n_ky.data < 1-2/h)).type_as(imgs.data))
-        return sampled #, in_view_mask
+        in_view_mask = V(((n_kx.data > -1+2/w) & (n_kx.data < 1-2/w) & (n_ky.data > -1+2/h) & (n_ky.data < 1-2/h)).type_as(imgs.data))
+        return sampled, in_view_mask
+
+def l1_loss(x1, x2, mask):
+    return torch.sum(torch.abs(mask*(x1-x2)))/(torch.sum(mask)+1) 
+
+def compute_img_stats(img):
+    # img_pad = torch.nn.ReplicationPad2d(1)(img)
+    img_pad = img
+    mu = F.avg_pool2d(img_pad, kernel_size=3, stride=1, padding=0)
+    sigma = F.avg_pool2d(img_pad**2, kernel_size=3, stride=1, padding=0) - mu**2
+    return mu, sigma
+
+def compute_SSIM(img0, img1 ):
+    mu0, sigma0= compute_img_stats(img0) 
+    mu1, sigma1= compute_img_stats(img1)
+    # img0_img1_pad = torch.nn.ReplicationPad2d(1)(img0 * img1)
+    img0_img1_pad = img0*img1
+    sigma01 = F.avg_pool2d(img0_img1_pad, kernel_size=3, stride=1, padding=0) - mu0*mu1
+    # C1 = .01 ** 2
+    # C2 = .03 ** 2
+    C1 = .001
+    C2 = .009
+
+    ssim_n = (2*mu0*mu1 + C1) * (2*sigma01 + C2)
+    ssim_d = (mu0**2 + mu1**2 + C1) * (sigma0 + sigma1 + C2)
+    ssim = ssim_n / ssim_d
+    return ((1-ssim)*.5).clamp(0, 1)
+
+def ssim_loss(img0, img1, mask):
+    b, c, h, w = img0.size()
+    SSIM = compute_SSIM(img0, img1)
+    h = (mask.size(2) - SSIM.size(2))//2
+    w = (mask.size(3) - SSIM.size(3))//2
+    SSIM = F.pad(SSIM, (w,w,h,h), mode='constant', value=0)
+    return torch.mean(
+        torch.sum(
+            torch.sum(torch.abs(SSIM*mask).view(b, c, -1), dim=-1 )/(1+torch.sum(mask.view(b, 1, -1), dim=-1)), 
+            dim = -1
+        )
+    )
 
 class TriAppearanceLoss(nn.Module):
-    def __init__(self, scale=0.5, ws=11):
+    def __init__(self, scale=0.5, ws=11, ndown=2):
         super().__init__()
         self.offset = Offset()
         self.sampler = BilinearProj()
 
         self.SSIM = SSIM(window_size = ws)
         self.scale = scale
-
+        
+        self.ndown = ndown
+        # chan pyramid num
+        self.maskds = ImagePyramidLayer(1, 1)
+        self.imgds = ImagePyramidLayer(3, 1)
+        
     def forward(self, d1, d3, poses_x2, x1, x2, x3, camera):
 
-        # cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
-        # cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
-        cx12, cy12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
-        cx32, cy32= self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
+        cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
+        cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
+        #cx12, cy12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
+        #cx32, cy32= self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
 
-        x12 = self.sampler.forward(x1, cx12, cy12)
-        x32 = self.sampler.forward(x3, cx32, cy32)
+        #x12 = self.sampler.forward(x1, cx12, cy12)
+        #x32 = self.sampler.forward(x3, cx32, cy32)
         
-        #x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
-        #x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
+        x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
+        x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
+
+        # mask12 = in_mask12.unsqueeze(1)
+        # mask32 = in_mask32.unsqueeze(1)
+        mask12 = (d_mask12*in_mask12).unsqueeze(1)
+        mask32 = (d_mask32*in_mask32).unsqueeze(1)
         
-        #mask12 = (d_mask12*in_mask12).unsqueeze(1)
-        #mask32 = (d_mask32*in_mask32).unsqueeze(1)
-        
-        #mask12.requires_grad = False
-        #mask32.requires_grad = False
+        mask12.requires_grad = False
+        mask32.requires_grad = False
         
         #print(type(x12))
         #print(type(x2m12))
         
-        #ssimloss = self.SSIM(x12, x2) + self.SSIM(x32, x2)
-        l2loss = F.mse_loss(x12, x2) + F.mse_loss(x32, x2)
-        l1loss = F.l1_loss(x12, x2) + F.l1_loss(x32, x2)
+        # loss on original scale
+        ssimloss = ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32)
+        l1loss = l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32)
+        
+        for i in range(self.ndown):
+            x12, x2, x32 = self.imgds.downsample(x12), self.imgds.downsample(x2), self.imgds.downsample(x32)
+            mask12, mask32 = self.maskds.downsample(mask12), self.maskds.downsample(mask32)
 
-        return l2loss + self.scale * l1loss, (l2loss, l1loss)
+            ssimloss += ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32)
+            l1loss += l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32)
+
+        mul = self.ndown+1
+        ssimloss, l1loss = ssimloss/mul, l1loss/mul
+        
+        return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
         #return ssimloss + self.scale * l1loss, (ssimloss, l1loss)
 
 
@@ -311,7 +376,7 @@ class SmoothLoss(nn.Module):
 
     def forward(self, imgs, masks=None):
         if masks is not None:
-            return (masks * self.laplacian(imgs))
+            return (masks * self.laplacian(imgs)).mean()
         else:
             return self.laplacian(imgs).mean()
 
@@ -380,3 +445,77 @@ class LaplacianLayer(nn.Module):
 #             return x.squeeze(1)
 #         elif input.dim() == 2:
 #             return x.squeeze(0).squeeze(0)
+
+
+class ImagePyramidLayer(nn.Module):
+    def __init__(self, chan, pyramid_layer_num):
+        super(ImagePyramidLayer, self).__init__()
+        self.pyramid_layer_num = pyramid_layer_num
+        K = torch.FloatTensor([[0.0751,   0.1238,    0.0751],
+                              [0.1238,   0.2042,    0.1238],
+                              [0.0751,   0.1238,    0.0751]]).view(1, 1, 3, 3)
+        self.register_buffer('smooth_kernel', K)
+        if chan>1:
+            k = K
+            K = torch.zeros(chan, chan, 3, 3)
+            for i in range(chan):
+                K[i, i, :, :] = k
+        self.register_buffer('smooth_kernel_K', K)
+        self.avg_pool_func = torch.nn.AvgPool2d(kernel_size=2, stride=2, padding=0)
+        self.reflection_pad_func = torch.nn.ReflectionPad2d(1)
+
+
+    def downsample(self, input):
+        output_dim = input.dim()
+        output_size = input.size()
+        if output_dim==2:
+            K = self.smooth_kernel
+            input = input.unsqueeze(0).unsqueeze(0)
+        elif output_dim==3:
+            K = self.smooth_kernel
+            input = input.unsqueeze(1)
+        else:
+            K = self.smooth_kernel_K
+
+        x = self.reflection_pad_func(input)
+
+        x = F.conv2d(input=x,
+                    weight=V(K),
+                    stride=1,
+                    padding=0)
+        # remove here if not work out
+        padding = [0, int(np.mod(input.size(-1), 2)), 0, int(np.mod(input.size(-2), 2))]
+        x = torch.nn.ReplicationPad2d(padding)(x)
+        # -----
+        x = self.avg_pool_func(x)
+
+        if output_dim==2:
+            x =  x.squeeze(0).squeeze(0)
+        elif output_dim==3:
+            x =  x.squeeze(1)
+
+        return x
+
+
+    def forward(self, input, do_detach=True):
+        pyramid = [input]
+        for i in range(self.pyramid_layer_num-1):
+            img_d = self.downsample(pyramid[i])
+            if isinstance(img_d, Variable) and do_detach:
+                img_d = img_d.detach()
+            pyramid.append(img_d)
+            assert(np.ceil(pyramid[i].size(-1)/2) == img_d.size(-1))
+        return pyramid
+
+
+    def get_coords(self, imH, imW):
+        x_pyramid = [np.arange(imW)+.5]
+        y_pyramid = [np.arange(imH)+.5]
+        for i in range(self.pyramid_layer_num-1):
+            offset = 2**i
+            stride = 2**(i+1)
+            x_pyramid.append(np.arange(offset, offset + stride*np.ceil(x_pyramid[i].shape[0]/2), stride))
+            y_pyramid.append(np.arange(offset, offset + stride*np.ceil(y_pyramid[i].shape[0]/2), stride))
+
+        return x_pyramid, y_pyramid
+
