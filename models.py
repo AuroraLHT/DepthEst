@@ -242,6 +242,113 @@ class Offset(nn.Module):
 
         return tkx, tky, dmask
 
+
+class Offset2(nn.Module):
+    '''
+        xnew = Rx + td
+        where R is determined by camera relative pose change using Rodrigues Rotation Formular
+    '''
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('o', torch.zeros([1,1]).type(torch.FloatTensor))
+        self.register_buffer('eye', torch.eye(3).type(torch.FloatTensor).unsqueeze(0))
+        
+    def factorize(self, vecs, dim):
+        mags = vecs.norm(p=2, dim=dim, keepdim=True)
+        return vecs/mags, mags
+
+    def rot_vec2mat(self, rot_vecs):
+        batch, _ = rot_vecs.size()
+        directs, angles = self.factorize(rot_vecs, 1)
+        
+        K0 = directs[:,:1]
+        K1 = directs[:,1:2]
+        K2 = directs[:,2:]
+        
+        o = V(self.o.repeat(batch, 1))
+        eye = V(self.eye.repeat(batch, 1, 1))
+        
+        #print(K0.type, K2.type, K1.type, o.type, eye.type)
+        angles = angles.unsqueeze(-1)
+        K = torch.cat((o, -K2, K1, K2, o, K0, -K1, K0, o), 1).view(-1, 3, 3) # form a cpro matrix
+        return eye + K * angles.sin() + torch.bmm(K,K) * (1-angles.cos()) # using the R formular
+    
+    def forward(self, pose, inv_depth, camera):
+        camera = camera.data
+        """
+            Params:
+                pose: relative pose, N X 6 vectors,
+                    1-3 is the transition vector
+                    4-6 is the rotation vector
+                inv_depth: invered depth map
+                camera: intrinsic camera parameters NX4: (fx, fy, cx, cy)
+            Return:
+                tkx: transformed camera pixel points - x-component
+                tky: transformed camera pixel points - y-component
+                dmask: binary map of pixel that keeps track in the future
+        """
+        batch, c, h, w = inv_depth.size()
+
+        cxy = camera[:, 2:].contiguous().view(batch, 1, 1, 2)
+        fxy = camera[:, :2].contiguous().view(batch, 1, 1, 2)
+
+        rot_vecs = pose[:,:3]
+        tran_vecs = pose[:, 3:]
+
+        rot_mats = self.rot_vec2mat(rot_vecs)
+
+        # grip points preperation
+        kx, ky = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
+        #kx, ky = kx+0.5, ky+0.5
+        kxy = torch.stack([kx, ky], dim=-1).repeat(batch, 1, 1, 1)
+        
+        hxy = (kxy - cxy)/fxy
+        
+        # augment the homogeneous coordinate, add the 1 z dimension
+        hxy = torch.stack((hxy, torch.ones(batch, h, w, 1)), dim=-1)
+        
+        hxy = V(hxy)
+        
+        # stack these trans together w.r.t the column
+        T = torch.cat((rot_mats, tran_vecs.unsqueeze(1)), dim=-1)
+        T = torch.cat((T, self.filler), dim=-2)
+
+        # homogeneous space to real space
+        rxy = hxy / inv_depth.permute(0,2,3,1)
+
+        # augment the realspace xyz coordinate, add the 1 dimension for xyz transistion
+        rxy = torch.stack((rxy, torch.ones(batch, h, w, 1)), dim=-1)
+
+        # transformation : Output Size NX3XHXW 
+        # calculate the transformed extended homogenerous coordinate(in projective space) of the camera screen
+        
+        # add dummy dimension for broadcasting
+        T = T.unsqueeze(1).unsqueeze(2)
+        rxy = rxy.unsqueeze(-1)
+
+        t_xyz = torch.matmul(T, rxy).unsqueeze(-1)
+        t_xyz = t_xyz.permute(0,3,1,2)
+
+        # thxyz = torch.matmul(rot_mats[:, :, :2].unsqueeze(1).unsqueeze(2), hxy.unsqueeze(-1)).squeeze(-1).permute(0,3,1,2)
+        # thxyz = thxyz + rot_mats[:, :, 2].unsqueeze(-1).unsqueeze(-1) 
+        # thxyz = thxyz + tran_vecs.unsqueeze(-1).unsqueeze(-1) * inv_depth
+        
+        # project the pixel in "tilted" projective space to projective space       
+        t_hxy = t_xyz[:, :2] / t_xyz[:, 2:3].clamp(min=EPS)
+        
+        # projective space to camera space
+        cxy = V(cxy.view(batch, 2, 1, 1))
+        fxy = V(fxy.view(batch, 2, 1, 1))
+        
+        #tkxy = (thxy_warp * fxy) + cxy - V(kxy.permute(0,3,1,2))
+        t_kxy = (t_hxy * fxy) + cxy
+        t_kx, t_ky = t_kxy[:, 0], t_kxy[:, 1]
+
+        dmask = V((t_xyz[:, 2].data>EPS).type_as(inv_depth.data))
+
+        return t_kx, t_ky, dmask
+
+
 class BilinearProj(nn.Module):
     """
         bilinear sampler
@@ -329,8 +436,11 @@ class TriAppearanceLoss(nn.Module):
         
     def forward(self, d1, d3, poses_x2, x1, x2, x3, camera):
 
-        cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
-        cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
+        cx12, cy12, d_mask12 = self.offset2.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
+        cx32, cy32, d_mask32 = self.offset2.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
+
+        #cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
+        #cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
         #cx12, cy12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
         #cx32, cy32= self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
 
