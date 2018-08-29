@@ -10,6 +10,9 @@ from fastai.conv_learner import *
 # part of architecture is copied from fastai library
 
 # transfer learning from pretrain resnet34
+MIN_DISP = 0.01
+DISP_SCALING = 100
+
 EPS = 1e-10
 f = resnet34
 cut,lr_cut = model_meta[f]
@@ -73,11 +76,11 @@ class UnetBlock(nn.Module):
 """
 
 class Pose(nn.Module):
-    def __init__(self, inc):
+    def __init__(self, inc, mag_scalor = 1):
         super().__init__()
         self.ps = 6
         self.multi = 2
-        self.mag_scalor = .5
+        self.mag_scalor = mag_scalor
 
         self.body = nn.Sequential(
             nn.Conv2d(inc, 128, 3, stride=1, padding=0, bias=True),
@@ -130,7 +133,9 @@ class Depth34(nn.Module):
         x = self.up5(x, inp)
         x = self.up6(x)
         
-        return F.sigmoid(x), self.sfs[3].features #, x
+        return DISP_SCALING * F.sigmoid(x) + MIN_DISP, self.sfs[3].features #, x
+
+        #return F.sigmoid(x), self.sfs[3].features #, x
         #return F.sigmoid(self.op_norm(x)), self.sfs[3].features #, x
         #return 1/torch.clamp(F.relu(x), 0.1, 500), self.sfs[3].features 
         #return x, self.sfs[3].features 
@@ -252,21 +257,22 @@ class Offset2(nn.Module):
         super().__init__()
         self.register_buffer('o', torch.zeros([1,1]).type(torch.FloatTensor))
         self.register_buffer('eye', torch.eye(3).type(torch.FloatTensor).unsqueeze(0))
+        self.register_buffer('filler', torch.FloatTensor([0,0,0,1]).unsqueeze(0))
         
     def factorize(self, vecs, dim):
         mags = vecs.norm(p=2, dim=dim, keepdim=True)
         return vecs/mags, mags
 
     def rot_vec2mat(self, rot_vecs):
-        batch, _ = rot_vecs.size()
+        b, _ = rot_vecs.size()
         directs, angles = self.factorize(rot_vecs, 1)
         
         K0 = directs[:,:1]
         K1 = directs[:,1:2]
         K2 = directs[:,2:]
         
-        o = V(self.o.repeat(batch, 1))
-        eye = V(self.eye.repeat(batch, 1, 1))
+        o = Variable(self.o.repeat(b, 1))
+        eye = Variable(self.eye.repeat(b, 1, 1))
         
         #print(K0.type, K2.type, K1.type, o.type, eye.type)
         angles = angles.unsqueeze(-1)
@@ -287,10 +293,10 @@ class Offset2(nn.Module):
                 tky: transformed camera pixel points - y-component
                 dmask: binary map of pixel that keeps track in the future
         """
-        batch, c, h, w = inv_depth.size()
+        b, c, h, w = inv_depth.size()
 
-        cxy = camera[:, 2:].contiguous().view(batch, 1, 1, 2)
-        fxy = camera[:, :2].contiguous().view(batch, 1, 1, 2)
+        cxy = camera[:, 2:].contiguous().view(b, 1, 1, 2)
+        fxy = camera[:, :2].contiguous().view(b, 1, 1, 2)
 
         rot_vecs = pose[:,:3]
         tran_vecs = pose[:, 3:]
@@ -300,24 +306,24 @@ class Offset2(nn.Module):
         # grip points preperation
         kx, ky = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
         #kx, ky = kx+0.5, ky+0.5
-        kxy = torch.stack([kx, ky], dim=-1).repeat(batch, 1, 1, 1)
+        kxy = torch.stack([kx, ky], dim=-1).repeat(b, 1, 1, 1)
         
         hxy = (kxy - cxy)/fxy
         
         # augment the homogeneous coordinate, add the 1 z dimension
-        hxy = torch.stack((hxy, torch.ones(batch, h, w, 1)), dim=-1)
+        hxy = torch.cat((hxy, torch.ones(b, h, w, 1).type_as(hxy)), dim=-1)
         
         hxy = V(hxy)
         
         # stack these trans together w.r.t the column
-        T = torch.cat((rot_mats, tran_vecs.unsqueeze(1)), dim=-1)
-        T = torch.cat((T, self.filler), dim=-2)
+        T = torch.cat((rot_mats, tran_vecs.unsqueeze(-1)), dim=-1)
+        T = torch.cat((T, V(self.filler).repeat(b, 1, 1) ), dim=-2)
 
         # homogeneous space to real space
         rxy = hxy / inv_depth.permute(0,2,3,1)
 
         # augment the realspace xyz coordinate, add the 1 dimension for xyz transistion
-        rxy = torch.stack((rxy, torch.ones(batch, h, w, 1)), dim=-1)
+        rxy = torch.cat((rxy, V(torch.ones(b, h, w, 1))), dim=-1)
 
         # transformation : Output Size NX3XHXW 
         # calculate the transformed extended homogenerous coordinate(in projective space) of the camera screen
@@ -326,29 +332,152 @@ class Offset2(nn.Module):
         T = T.unsqueeze(1).unsqueeze(2)
         rxy = rxy.unsqueeze(-1)
 
-        t_xyz = torch.matmul(T, rxy).unsqueeze(-1)
+        t_xyz = torch.matmul(T, rxy).squeeze(-1)
         t_xyz = t_xyz.permute(0,3,1,2)
 
-        # thxyz = torch.matmul(rot_mats[:, :, :2].unsqueeze(1).unsqueeze(2), hxy.unsqueeze(-1)).squeeze(-1).permute(0,3,1,2)
-        # thxyz = thxyz + rot_mats[:, :, 2].unsqueeze(-1).unsqueeze(-1) 
-        # thxyz = thxyz + tran_vecs.unsqueeze(-1).unsqueeze(-1) * inv_depth
-        
-        # project the pixel in "tilted" projective space to projective space       
-        t_hxy = t_xyz[:, :2] / t_xyz[:, 2:3].clamp(min=EPS)
+        t_xy = t_xyz[:, :2] 
+        t_z = t_xyz[:, 2:3].clamp(min=EPS)
         
         # projective space to camera space
-        cxy = V(cxy.view(batch, 2, 1, 1))
-        fxy = V(fxy.view(batch, 2, 1, 1))
+        cxy = V(cxy.view(b, 2, 1, 1))
+        fxy = V(fxy.view(b, 2, 1, 1))        
+        t_kxy = ((t_xy * fxy) + cxy) / t_z
         
-        #tkxy = (thxy_warp * fxy) + cxy - V(kxy.permute(0,3,1,2))
-        t_kxy = (t_hxy * fxy) + cxy
+        # divided the result and return
         t_kx, t_ky = t_kxy[:, 0], t_kxy[:, 1]
-
-        dmask = V((t_xyz[:, 2].data>EPS).type_as(inv_depth.data))
-
+        dmask = V((t_xyz[:, 2].data>EPS).type_as(inv_depth.data)) 
         return t_kx, t_ky, dmask
 
+    
 
+class Offset3(nn.Module):
+    '''
+        xnew = Rx + td
+        where R is determined by camera relative pose change using Rodrigues Rotation Formular
+    '''
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('o', torch.zeros([1,1]).type(torch.FloatTensor))
+        self.register_buffer('eye', torch.eye(3).type(torch.FloatTensor).unsqueeze(0))
+        self.register_buffer('filler', torch.FloatTensor([0,0,0,1]).unsqueeze(0))
+        
+    def factorize(self, vecs, dim):
+        mags = vecs.norm(p=2, dim=dim, keepdim=True)
+        return vecs/mags, mags
+
+    def rot_vec2mat(self, rot_vecs):
+        b, _ = rot_vecs.size()
+        directs, angles = self.factorize(rot_vecs, 1)
+        
+        K0 = directs[:,:1]
+        K1 = directs[:,1:2]
+        K2 = directs[:,2:]
+        
+        o = Variable(self.o.repeat(b, 1))
+        eye = Variable(self.eye.repeat(b, 1, 1))
+        
+        #print(K0.type, K2.type, K1.type, o.type, eye.type)
+        angles = angles.unsqueeze(-1)
+        K = torch.cat((o, -K2, K1, K2, o, K0, -K1, K0, o), 1).view(-1, 3, 3) # form a cpro matrix
+        return eye + K * angles.sin() + torch.bmm(K,K) * (1-angles.cos()) # using the R formular
+    
+    def pose_vec2mat(self, pose):
+        b = pose.size(0)
+        rot_vecs = pose[:,:3]
+        tran_vecs = pose[:, 3:]
+
+        rot_mats = self.rot_vec2mat(rot_vecs)
+
+        # stack these trans together w.r.t the column
+        pose = torch.cat((rot_mats, tran_vecs.unsqueeze(-1)), dim=-1)
+        pose = torch.cat((pose, V(self.filler.repeat(b, 1, 1))), dim=-2)
+
+        return pose
+        
+    def pixel2cam(self, inv_depth, pixel_coors, inv_intrinsics, ishomo=True):
+        b, c, h , w = inv_depth.size()
+        inv_depth = inv_depth.permute(0,2,3,1)
+        pixel_coors = pixel_coors.unsqueeze(-1)
+        inv_intrinsics = inv_intrinsics.unsqueeze(1).unsqueeze(2)
+        cam_coors = torch.matmul(inv_intrinsics, pixel_coors).squeeze(-1)
+        
+        cam_coors = cam_coors * inv_depth # test for not inverse depth map
+        #cam_coors = cam_coors / inv_depth
+        if ishomo:
+            cam_coors = torch.cat((cam_coors, V(torch.ones(b, h, w, 1))), dim=-1)
+        return cam_coors
+    
+    def cam2pixel(self, cam_coords, proj):
+        b, h, w, c = cam_coords.size()
+        proj = proj.unsqueeze(1).unsqueeze(2)
+        cam_coords = cam_coords.unsqueeze(-1)
+        #pdb.set_trace()
+        unnormalized_pixel_coords = torch.matmul(proj, cam_coords).squeeze(-1)
+        
+        x_u = unnormalized_pixel_coords[:, :, :, 0]
+        y_u = unnormalized_pixel_coords[:, :, :, 1]
+        z_u = unnormalized_pixel_coords[:, :, :, 2]
+        
+        x_n = x_u / (z_u + EPS)
+        y_n = y_u / (z_u + EPS)
+        
+        #pdb.set_trace()
+        return x_n, y_n, V(z_u.data>EPS)
+    
+    def forward(self, pose, inv_depth, camera):
+        
+        """
+            Params:
+                pose: relative pose, N X 6 vectors,
+                    1-3 is the transition vector
+                    4-6 is the rotation vector
+                inv_depth: invered depth map
+                camera: intrinsic camera parameters NX4: (fx, fy, cx, cy)
+            Return:
+                tkx: transformed camera pixel points - x-component
+                tky: transformed camera pixel points - y-component
+                dmask: binary map of pixel that keeps track in the future
+        """
+        b, c, h, w = inv_depth.size()
+        
+        # build the camera intrinsic matrix
+        camera = camera.data
+        cx = camera[:, 2:3].contiguous()
+        cy = camera[:, 3:4].contiguous()
+        fx = camera[:, 0:1].contiguous()
+        fy = camera[:, 1:2].contiguous()
+        
+        o = self.o.repeat(b,1)
+        intrinsics = torch.cat(
+            [fx, o, cx, o,
+             o, fy, cy, o,
+             o, o, o+1, o,
+             o, o, o, o+1], dim=-1).view(b,4,4)
+        
+        inv_intrinsics = torch.cat(
+            [1/fx, o, -cx/fx,
+             o, 1/fy, -cy/fy,
+             o, o, o+1], dim=-1
+        ).view(b,3,3)
+        
+        intrinsics = V(intrinsics)
+        inv_intrinsics = V(inv_intrinsics)
+
+        pose = self.pose_vec2mat(pose)
+       
+        # grip points preperation
+        px, py = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
+        pixel_coords = torch.stack([px, py, torch.ones_like(px)], dim=-1).repeat(b, 1, 1, 1)
+        pixel_coords = V(pixel_coords)
+        
+        cam_coords = self.pixel2cam(inv_depth, pixel_coords, inv_intrinsics)
+        
+        proj_tgt_cam_to_src_pixel = torch.matmul(intrinsics, pose)
+        #pdb.set_trace()
+        x_n, y_n, dmask = self.cam2pixel(cam_coords, proj_tgt_cam_to_src_pixel)
+
+        return x_n, y_n, dmask.type_as(inv_depth)
+    
 class BilinearProj(nn.Module):
     """
         bilinear sampler
@@ -423,7 +552,7 @@ def ssim_loss(img0, img1, mask):
 class TriAppearanceLoss(nn.Module):
     def __init__(self, scale=0.5, ws=11, ndown=2):
         super().__init__()
-        self.offset = Offset()
+        self.offset = Offset3()
         self.sampler = BilinearProj()
 
         self.SSIM = SSIM(window_size = ws)
@@ -436,8 +565,8 @@ class TriAppearanceLoss(nn.Module):
         
     def forward(self, d1, d3, poses_x2, x1, x2, x3, camera):
 
-        cx12, cy12, d_mask12 = self.offset2.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
-        cx32, cy32, d_mask32 = self.offset2.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
+        cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
+        cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
 
         #cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
         #cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
@@ -458,8 +587,8 @@ class TriAppearanceLoss(nn.Module):
         mask12.requires_grad = False
         mask32.requires_grad = False
         
-        #print(type(x12))
-        #print(type(x2m12))
+        # print(type(x12))
+        # print(type(x2m12))
         
         # loss on original scale
         ssimloss = ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32)
@@ -469,11 +598,12 @@ class TriAppearanceLoss(nn.Module):
             x12, x2, x32 = self.imgds.downsample(x12), self.imgds.downsample(x2), self.imgds.downsample(x32)
             mask12, mask32 = self.maskds.downsample(mask12), self.maskds.downsample(mask32)
 
-            ssimloss += ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32)
+            #ssimloss += ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32)
             l1loss += l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32)
 
         mul = self.ndown+1
-        ssimloss, l1loss = ssimloss/mul, l1loss/mul
+        # ssimloss = ssimloss/mul 
+        l1loss = l1loss/mul
         
         return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
         #return ssimloss + self.scale * l1loss, (ssimloss, l1loss)

@@ -1,5 +1,7 @@
 !/tmp
 /tmp/*
+/.vscode
+!/.vscode/*
 /.ipynb_checkpoints
 !/.ipynb_checkpoints/*
 submit.bash
