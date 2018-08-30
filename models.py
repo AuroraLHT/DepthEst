@@ -133,6 +133,7 @@ class Depth34(nn.Module):
         x = self.up5(x, inp)
         x = self.up6(x)
         
+        # return disparity map and the output of the encoder
         return DISP_SCALING * F.sigmoid(x) + MIN_DISP, self.sfs[3].features #, x
 
         #return F.sigmoid(x), self.sfs[3].features #, x
@@ -400,9 +401,8 @@ class Offset3(nn.Module):
         pixel_coors = pixel_coors.unsqueeze(-1)
         inv_intrinsics = inv_intrinsics.unsqueeze(1).unsqueeze(2)
         cam_coors = torch.matmul(inv_intrinsics, pixel_coors).squeeze(-1)
-        
-        cam_coors = cam_coors * inv_depth # test for not inverse depth map
-        #cam_coors = cam_coors / inv_depth
+                
+        cam_coors = cam_coors / inv_depth
         if ishomo:
             cam_coors = torch.cat((cam_coors, V(torch.ones(b, h, w, 1))), dim=-1)
         return cam_coors
