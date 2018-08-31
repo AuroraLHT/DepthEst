@@ -11,7 +11,7 @@ from fastai.conv_learner import *
 
 # transfer learning from pretrain resnet34
 MIN_DISP = 0.01
-DISP_SCALING = 100
+DISP_SCALING = 10
 
 EPS = 1e-10
 f = resnet34
