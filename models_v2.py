@@ -76,6 +76,16 @@ class UnetBlock(nn.Module):
         cat_p = torch.cat([up_p,x_p], dim=1)
         return self.bn(F.relu(cat_p))
 
+class DepthFuseBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear')
+        self.cont = Conv(1, 1, 3, 1, 1, None)
+        self.fuse = Conv(2, 1, 3, 1, 1, nn.Sigmoid())
+    def forward(self, up_d, d):    
+        up_d = self.cont(self.up(up_d))
+        return self.fuse(torch.cat((up_d, d), dim=1))
+    
 class Pose(nn.Module):
     def __init__(self, inc, mag_scalor = 1):
         super().__init__()
@@ -111,6 +121,10 @@ class Depth34(nn.Module):
         self.d3 =  Conv( 64, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d4 =  Conv( 64, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d5 =  Conv( 16, 1, 3, 1, 1, activation_func=nn.Sigmoid() )   
+        self.fuse2 = DepthFuseBlock()
+        self.fuse3 = DepthFuseBlock()
+        self.fuse4 = DepthFuseBlock()
+        self.fuse5 = DepthFuseBlock()
         #self.op_norm = torch.nn.InstanceNorm2d(1)
     
     def forward(self,x):
@@ -119,17 +133,29 @@ class Depth34(nn.Module):
         depthmaps = []
 
         x = self.up1(x, self.sfs[3].features)
-        depthmaps.append(self.d1(x))
-        x = self.up2(x, self.sfs[2].features)
-        depthmaps.append(self.d2(x))
-        x = self.up3(x, self.sfs[1].features)
-        depthmaps.append(self.d3(x))
-        x = self.up4(x, self.sfs[0].features)
-        depthmaps.append(self.d4(x))
-        x = self.up5(x, inp)
-        depthmaps.append(self.d5(x))
+        d1 = self.d1(x)
+        #depthmaps.append(d1)
         
-        depthmaps = depthmaps.reverse()
+        x = self.up2(x, self.sfs[2].features)
+        d2 = self.fuse2( d1, self.d2(x) )
+        #depthmaps.append(d2)
+        
+        x = self.up3(x, self.sfs[1].features)
+        d3 = self.fuse3( d2, self.d3(x) )
+        #depthmaps.append(d3)
+        
+        x = self.up4(x, self.sfs[0].features)
+        d4 = self.fuse4( d3, self.d4(x) )
+        #depthmaps.append(d4)
+        
+        x = self.up5(x, inp)
+        d5 = self.fuse5( d4, self.d5(x) )
+        depthmaps.append(d5)
+        
+        depthmaps = [ d * DISP_SCALING + MIN_DISP for d in depthmaps ]
+            
+        
+        depthmaps.reverse()
 
         # return disparity map and the output of the encoder
         return depthmaps, self.sfs[3].features
@@ -552,15 +578,15 @@ class TriAppearanceLoss(nn.Module):
         self.scale = scale        
         self.imgds = DownSampleLayer(chan=3)
         
-    def forward(self, d1s, d3s, poses_x2, x1, x2, x3, camera):
-        l1osses = []
+    def forward(self, d2s, poses_x2, x1, x2, x3, camera):
+        l1losses = []
         ssimlosses = []
-        for i, d1, d3 in enumerate(zip(d1s, d3s)):
+        for i, d2 in enumerate(d2s):
             if i > 0 :
                 x12, x2, x32 = self.imgds(x12), self.imgds(x2), self.imgds(x32)
             
-            cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
-            cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
+            cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d2, camera = camera)
+            cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d2, camera = camera)
 
             x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
             x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
@@ -576,10 +602,10 @@ class TriAppearanceLoss(nn.Module):
             l1losses.append( l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32) )
             ssimlosses.append( ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32) )       
         
-        l1loss = torch.mean(l1losses)
-        ssimlosses = torch.mean(ssimlosses)
+        l1loss = torch.mean(torch.cat(l1losses, dim=0))
+        ssimloss = torch.mean(torch.cat(ssimlosses, dim=0))
 
-        return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
+        return self.scale * ssimloss + l1loss, (self.scale * ssimloss, l1loss)
         
 
 class SmoothLoss(nn.Module):
