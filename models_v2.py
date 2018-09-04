@@ -8,8 +8,6 @@ from fastai.conv_learner import *
 # part of architecture is copied from fastai library
 
 # transfer learning from pretrain resnet34
-MIN_DISP = 0.01
-DISP_SCALING = 10
 
 EPS = 1e-10
 f = resnet34
@@ -127,35 +125,38 @@ class Depth34(nn.Module):
         self.fuse5 = DepthFuseBlock()
         #self.op_norm = torch.nn.InstanceNorm2d(1)
     
-    def forward(self,x):
+        self.MIN_DISP = 0.01
+        self.DISP_SCALING = 10
+
+    def forward(self, x, enc_only=False):
         inp = x
         x = F.elu(self.rn(x))        
         depthmaps = []
 
-        x = self.up1(x, self.sfs[3].features)
-        d1 = self.d1(x)
-        #depthmaps.append(d1)
-        
-        x = self.up2(x, self.sfs[2].features)
-        d2 = self.fuse2( d1, self.d2(x) )
-        #depthmaps.append(d2)
-        
-        x = self.up3(x, self.sfs[1].features)
-        d3 = self.fuse3( d2, self.d3(x) )
-        #depthmaps.append(d3)
-        
-        x = self.up4(x, self.sfs[0].features)
-        d4 = self.fuse4( d3, self.d4(x) )
-        #depthmaps.append(d4)
-        
-        x = self.up5(x, inp)
-        d5 = self.fuse5( d4, self.d5(x) )
-        depthmaps.append(d5)
-        
-        depthmaps = [ d * DISP_SCALING + MIN_DISP for d in depthmaps ]
+        if not enc_only:
+            x = self.up1(x, self.sfs[3].features)
+            d1 = self.d1(x)
+            #depthmaps.append(d1)
             
-        
-        depthmaps.reverse()
+            x = self.up2(x, self.sfs[2].features)
+            d2 = self.fuse2( d1, self.d2(x) )
+            #depthmaps.append(d2)
+            
+            x = self.up3(x, self.sfs[1].features)
+            d3 = self.fuse3( d2, self.d3(x) )
+            #depthmaps.append(d3)
+            
+            x = self.up4(x, self.sfs[0].features)
+            d4 = self.fuse4( d3, self.d4(x) )
+            #depthmaps.append(d4)
+            
+            x = self.up5(x, inp)
+            d5 = self.fuse5( d4, self.d5(x) )
+            depthmaps.append(d5)
+            
+            depthmaps = [ d * self.DISP_SCALING + self.MIN_DISP for d in depthmaps ]
+                            
+            depthmaps.reverse()
 
         # return disparity map and the output of the encoder
         return depthmaps, self.sfs[3].features
@@ -169,15 +170,16 @@ class Depth34(nn.Module):
         for sf in self.sfs: sf.remove()
 
 class TriDepth(nn.Module):
-    def __init__(self, rn, ochannel):
+    def __init__(self, rn, ochannel, train=True):
         super().__init__()
         self.depth = Depth34(rn, ochannel) 
         self.pose = Pose(256*3)
 
     def forward(self, x1, x2, x3):
-        d1, ft1 = self.depth(x1)
-        d2, ft2 = self.depth(x2) 
-        d3, ft3 = self.depth(x3)
+        if train:
+            d1, ft1 = self.depth(x1, enc_only=True) # src
+            d2, ft2 = self.depth(x2, enc_only=False) # target
+            d3, ft3 = self.depth(x3, enc_only=True) # src
         poses_x2 = self.pose(torch.cat((ft1,ft2,ft3), dim=1))
 
         return d1, d2, d3, poses_x2
@@ -429,6 +431,7 @@ class Offset3(nn.Module):
         return cam_coors
     
     def cam2pixel(self, cam_coords, proj):
+        
         b, h, w, c = cam_coords.size()
         proj = proj.unsqueeze(1).unsqueeze(2)
         cam_coords = cam_coords.unsqueeze(-1)
@@ -451,12 +454,12 @@ class Offset3(nn.Module):
             Params:
                 pose: relative pose, N X 6 vectors,
                     1-3 is the transition vector
-                    4-6 is the rotation vector
+                    4-6 is the rotation vector in eular representation
                 inv_depth: invered depth map
                 camera: intrinsic camera parameters NX4: (fx, fy, cx, cy)
             Return:
-                tkx: transformed camera pixel points - x-component
-                tky: transformed camera pixel points - y-component
+                tkx: transformed camera pixel coordinate - x-component
+                tky: transformed camera pixel coordinate - y-component
                 dmask: binary map of pixel that keeps track in the future
         """
         b, c, h, w = inv_depth.size()
