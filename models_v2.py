@@ -99,10 +99,18 @@ class Pose(nn.Module):
             nn.Conv2d(128, self.ps*self.multi, 3, bias=True),
             nn.AdaptiveAvgPool2d((1,1))
         )
+        
+        self.tran_mag = 0.001
+        self.rot_mag= 0.01
+        
     def forward(self, x):
         x = self.body(x)
         batch, c, h, w = x.size()
-        return x.view(batch, self.multi, self.ps) * self.mag_scalor
+        x = x.view(batch, self.multi, self.ps)
+        
+        transistion = x[:, :, :3] * self.tran_mag
+        rotation = x[:, :, 3:] * self.rot_mag
+        return transistion, rotation
 
 class Depth34(nn.Module):
     def __init__(self, rn, ochannel):
@@ -144,11 +152,11 @@ class Depth34(nn.Module):
             
             x = self.up3(x, self.sfs[1].features)
             d3 = self.fuse3( d2, self.d3(x) )
-            #depthmaps.append(d3)
+            depthmaps.append(d3)
             
             x = self.up4(x, self.sfs[0].features)
             d4 = self.fuse4( d3, self.d4(x) )
-            #depthmaps.append(d4)
+            depthmaps.append(d4)
             
             x = self.up5(x, inp)
             d5 = self.fuse5( d4, self.d5(x) )
@@ -174,15 +182,20 @@ class TriDepth(nn.Module):
         super().__init__()
         self.depth = Depth34(rn, ochannel) 
         self.pose = Pose(256*3)
-
+        self.train = train
+        
     def forward(self, x1, x2, x3):
-        if train:
+        if self.train:
             d1, ft1 = self.depth(x1, enc_only=True) # src
             d2, ft2 = self.depth(x2, enc_only=False) # target
             d3, ft3 = self.depth(x3, enc_only=True) # src
-        poses_x2 = self.pose(torch.cat((ft1,ft2,ft3), dim=1))
+        else:
+            d1, ft1 = self.depth(x1, enc_only=False) # src
+            d2, ft2 = self.depth(x2, enc_only=False) # target
+            d3, ft3 = self.depth(x3, enc_only=False) # src            
+        trans, rotation = self.pose(torch.cat((ft1,ft2,ft3), dim=1))
 
-        return d1, d2, d3, poses_x2
+        return d1, d2, d3, trans, rotation
 
 class TriDepthModel():
     def __init__(self,model,name='tridepth'):
@@ -405,10 +418,10 @@ class Offset3(nn.Module):
         K = torch.cat((o, -K2, K1, K2, o, K0, -K1, K0, o), 1).view(-1, 3, 3) # form a cpro matrix
         return eye + K * angles.sin() + torch.bmm(K,K) * (1-angles.cos()) # using the R formular
     
-    def pose_vec2mat(self, pose):
-        b = pose.size(0)
-        rot_vecs = pose[:,:3]
-        tran_vecs = pose[:, 3:]
+    def pose_vec2mat(self, trans, rotation):
+        b = trans.size(0)
+        rot_vecs = rotation
+        tran_vecs = trans
 
         rot_mats = self.rot_vec2mat(rot_vecs)
 
@@ -448,7 +461,7 @@ class Offset3(nn.Module):
         #pdb.set_trace()
         return x_n, y_n, V(z_u.data>EPS)
     
-    def forward(self, pose, inv_depth, camera):
+    def forward(self, trans, rotation, inv_depth, camera):
         
         """
             Params:
@@ -486,7 +499,7 @@ class Offset3(nn.Module):
         intrinsics = V(intrinsics)
         inv_intrinsics = V(inv_intrinsics)
 
-        pose = self.pose_vec2mat(pose)
+        pose = self.pose_vec2mat(trans, rotation)
        
         # grip points preperation
         px, py = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
@@ -580,16 +593,16 @@ class TriAppearanceLoss(nn.Module):
 
         self.scale = scale        
         self.imgds = DownSampleLayer(chan=3)
+        #self.depthus = nn.Upsample(scale_factor=2, mode='bilinear')
         
-    def forward(self, d2s, poses_x2, x1, x2, x3, camera):
+    def forward(self, d2s, trans, rotation, x1, x2, x3, camera):
         l1losses = []
         ssimlosses = []
-        for i, d2 in enumerate(d2s):
-            if i > 0 :
-                x12, x2, x32 = self.imgds(x12), self.imgds(x2), self.imgds(x32)
+        for i, d2 in enumerate(d2s):            
+            if i>0: d2 = F.upsample(input=d2, scale_factor=2**i, mode='bilinear')
             
-            cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d2, camera = camera)
-            cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d2, camera = camera)
+            cx12, cy12, d_mask12 = self.offset.forward(trans[:, 0], rotation[:, 0], inv_depth = d2, camera = camera)
+            cx32, cy32, d_mask32 = self.offset.forward(trans[:, 1], rotation[:, 1], inv_depth = d2, camera = camera)
 
             x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
             x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
@@ -608,7 +621,7 @@ class TriAppearanceLoss(nn.Module):
         l1loss = torch.mean(torch.cat(l1losses, dim=0))
         ssimloss = torch.mean(torch.cat(ssimlosses, dim=0))
 
-        return self.scale * ssimloss + l1loss, (self.scale * ssimloss, l1loss)
+        return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
         
 
 class SmoothLoss(nn.Module):
