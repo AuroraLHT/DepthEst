@@ -144,11 +144,11 @@ class Depth34(nn.Module):
         if not enc_only:
             x = self.up1(x, self.sfs[3].features)
             d1 = self.d1(x)
-            #depthmaps.append(d1)
+#             depthmaps.append(d1)
             
             x = self.up2(x, self.sfs[2].features)
             d2 = self.fuse2( d1, self.d2(x) )
-            #depthmaps.append(d2)
+#             depthmaps.append(d2)
             
             x = self.up3(x, self.sfs[1].features)
             d3 = self.fuse3( d2, self.d3(x) )
@@ -436,8 +436,10 @@ class Offset3(nn.Module):
         inv_depth = inv_depth.permute(0,2,3,1)
         pixel_coors = pixel_coors.unsqueeze(-1)
         inv_intrinsics = inv_intrinsics.unsqueeze(1).unsqueeze(2)
+        
         cam_coors = torch.matmul(inv_intrinsics, pixel_coors).squeeze(-1)
-                
+        #pdb.set_trace()
+        # cam_coors = cam_coors * inv_depth
         cam_coors = cam_coors / inv_depth
         if ishomo:
             cam_coors = torch.cat((cam_coors, V(torch.ones(b, h, w, 1))), dim=-1)
@@ -511,7 +513,7 @@ class Offset3(nn.Module):
         proj_tgt_cam_to_src_pixel = torch.matmul(intrinsics, pose)
         #pdb.set_trace()
         x_n, y_n, dmask = self.cam2pixel(cam_coords, proj_tgt_cam_to_src_pixel)
-
+        #pdb.set_trace()
         return x_n, y_n, dmask.type_as(inv_depth)
     
 class BilinearProj(nn.Module):
@@ -580,7 +582,7 @@ def ssim_loss(img0, img1, mask):
     SSIM = F.pad(SSIM, (w,w,h,h), mode='constant', value=0)
     return torch.mean(
         torch.sum(
-            torch.sum(torch.abs(SSIM*mask).view(b, c, -1), dim=-1 )/(1+torch.sum(mask.view(b, 1, -1), dim=-1)), 
+            torch.sum((SSIM*mask).view(b, c, -1), dim=-1)/(1+torch.sum(mask.view(b, 1, -1), dim=-1)), 
             dim = -1
         )
     )
@@ -592,7 +594,7 @@ class TriAppearanceLoss(nn.Module):
         self.sampler = BilinearProj()
 
         self.scale = scale        
-        self.imgds = DownSampleLayer(chan=3)
+        #self.imgds = DownSampleLayer(chan=3)
         #self.depthus = nn.Upsample(scale_factor=2, mode='bilinear')
         
     def forward(self, d2s, trans, rotation, x1, x2, x3, camera):
@@ -602,26 +604,29 @@ class TriAppearanceLoss(nn.Module):
             if i>0: d2 = F.upsample(input=d2, scale_factor=2**i, mode='bilinear')
             
             cx12, cy12, d_mask12 = self.offset.forward(trans[:, 0], rotation[:, 0], inv_depth = d2, camera = camera)
-            cx32, cy32, d_mask32 = self.offset.forward(trans[:, 1], rotation[:, 1], inv_depth = d2, camera = camera)
+            #cx32, cy32, d_mask32 = self.offset.forward(trans[:, 1], rotation[:, 1], inv_depth = d2, camera = camera)
 
             x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
-            x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
+            #x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
 
             mask12 = (d_mask12*in_mask12).unsqueeze(1)
-            mask32 = (d_mask32*in_mask32).unsqueeze(1)
+            #mask32 = (d_mask32*in_mask32).unsqueeze(1)
             
             mask12.requires_grad = False
-            mask32.requires_grad = False
+            #mask32.requires_grad = False
             
             # loss on original scale
+            l1losses.append(l1_loss(x12, x2, mask12))
+            ssimlosses.append(ssim_loss(x12, x2, mask12))       
             
-            l1losses.append( l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32) )
-            ssimlosses.append( ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32) )       
+            #l1losses.append( l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32) )
+            #ssimlosses.append( ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32) )       
         
         l1loss = torch.mean(torch.cat(l1losses, dim=0))
         ssimloss = torch.mean(torch.cat(ssimlosses, dim=0))
 
         return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
+        #return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
         
 
 class SmoothLoss(nn.Module):
