@@ -11,6 +11,7 @@ __pycache__/*
 *.csv
 *.tar*
 *.zip*
+*.M
 pytorch_ssim/*
 *.pyc
 fastai

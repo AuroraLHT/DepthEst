@@ -593,6 +593,10 @@ class TriAppearanceLoss(nn.Module):
         self.offset = Offset3()
         self.sampler = BilinearProj()
 
+#         self.offset2 = Offset3()
+#         self.sampler2 = BilinearProj()
+
+        
         self.scale = scale        
         #self.imgds = DownSampleLayer(chan=3)
         #self.depthus = nn.Upsample(scale_factor=2, mode='bilinear')
@@ -605,27 +609,29 @@ class TriAppearanceLoss(nn.Module):
             
             cx12, cy12, d_mask12 = self.offset.forward(trans[:, 0], rotation[:, 0], inv_depth = d2, camera = camera)
             #cx32, cy32, d_mask32 = self.offset.forward(trans[:, 1], rotation[:, 1], inv_depth = d2, camera = camera)
+            #cx32, cy32, d_mask32 = self.offset2.forward(trans[:, 1], rotation[:, 1], inv_depth = d2, camera = camera)
 
             x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
-            #x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
+#             x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
+#             x32, in_mask32 = self.sampler2.forward(x3, cx32, cy32)
 
             mask12 = (d_mask12*in_mask12).unsqueeze(1)
-            #mask32 = (d_mask32*in_mask32).unsqueeze(1)
+#             mask32 = (d_mask32*in_mask32).unsqueeze(1)
             
             mask12.requires_grad = False
-            #mask32.requires_grad = False
+#             mask32.requires_grad = False
             
             # loss on original scale
             l1losses.append(l1_loss(x12, x2, mask12))
             ssimlosses.append(ssim_loss(x12, x2, mask12))       
             
-            #l1losses.append( l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32) )
-            #ssimlosses.append( ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32) )       
+#             l1losses.append( l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32) )
+#             ssimlosses.append( ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32) )       
         
         l1loss = torch.mean(torch.cat(l1losses, dim=0))
         ssimloss = torch.mean(torch.cat(ssimlosses, dim=0))
 
-        return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
+        return (1-self.scale) * ssimloss + self.scale * l1loss, ((1-self.scale) * ssimloss, self.scale * l1loss)
         #return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
         
 

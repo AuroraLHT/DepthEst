@@ -58,3 +58,5 @@ this page shows the composition of P and well explains it.
 
 4. Camera in Theory (Pinhole camera model)
 https://en.wikipedia.org/wiki/Pinhole_camera_model#The_geometry_and_mathematics_of_the_pinhole_camera
+
+
