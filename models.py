@@ -178,21 +178,26 @@ class Depth34(nn.Module):
         for sf in self.sfs: sf.remove()
 
 class TriDepth(nn.Module):
-    def __init__(self, rn, ochannel, train=True):
+    def __init__(self, rn, ochannel):
         super().__init__()
         self.depth = Depth34(rn, ochannel) 
         self.pose = Pose(256*3)
-        self.train = train
+        #self.train = train
         
     def forward(self, x1, x2, x3):
-        if self.train:
-            d1, ft1 = self.depth(x1, enc_only=True) # src
-            d2, ft2 = self.depth(x2, enc_only=False) # target
-            d3, ft3 = self.depth(x3, enc_only=True) # src
-        else:
-            d1, ft1 = self.depth(x1, enc_only=False) # src
-            d2, ft2 = self.depth(x2, enc_only=False) # target
-            d3, ft3 = self.depth(x3, enc_only=False) # src            
+
+        d1, ft1 = self.depth(x1, enc_only=True) # src
+        d2, ft2 = self.depth(x2, enc_only=False) # target
+        d3, ft3 = self.depth(x3, enc_only=True) # src
+
+#         if self.train:
+#             d1, ft1 = self.depth(x1, enc_only=True) # src
+#             d2, ft2 = self.depth(x2, enc_only=False) # target
+#             d3, ft3 = self.depth(x3, enc_only=True) # src
+#         else:
+#             d1, ft1 = self.depth(x1, enc_only=False) # src
+#             d2, ft2 = self.depth(x2, enc_only=False) # target
+#             d3, ft3 = self.depth(x3, enc_only=False) # src            
         trans, rotation = self.pose(torch.cat((ft1,ft2,ft3), dim=1))
 
         return d1, d2, d3, trans, rotation

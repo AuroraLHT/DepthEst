@@ -3,24 +3,27 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from fastai.column_data import *
+from fastai.conv_learner import *
+from fastai.dataset import *
+
 class UnsupFilesDataset(FilesDataset):
     def __init__(self, fnames, y, transform, path):
         super().__init__(fnames, transform, path)
     def get_y(self, i): return None
     def get_c(self): return 0
-
+    
 class UnShuffleImageData(ImageData):
     def __init__(self, path, datasets, bs, num_workers, classes):
         trn_ds,val_ds,fix_ds,aug_ds,test_ds,test_aug_ds = datasets
-        self.path,self.bs,self.num_workers,self.classes=path,bs,num_workers,classes
-        self.trn_dl,self.val_dl,self.fix_dl,self.aug_dl,self.test_dl,self.test_aug_dl = 
-        [
+        self.path,self.bs,self.num_workers,self.classes = path,bs,num_workers,classes
+        self.trn_dl,self.val_dl,self.fix_dl,self.aug_dl,self.test_dl,self.test_aug_dl = [
             self.get_dl(ds,shuf) for ds,shuf in [
                 (trn_ds,False),(val_ds,False),(fix_ds,False),(aug_ds,False),
                 (test_ds,False),(test_aug_ds,False)
             ]
-        ]    
-        
+        ]
+
 class UnScaleTransforms():
     def __init__(self, sz, tfms, normalizer, denorm,
                  tfm_y=TfmType.NO, sz_y=None):
@@ -32,9 +35,8 @@ class UnScaleTransforms():
 
     def __call__(self, im, y=None): return compose(im, y, self.tfms)
     def __repr__(self): return str(self.tfms)
-        
+    
 # just a little modification which remove the multipler at the batch size of the val DL
-# DBS : double batch size
 class UnDBSColumnarModelData(ModelData):
     def __init__(self, path, trn_ds, val_ds, bs, test_ds=None, shuffle=True):
         test_dl = DataLoader(test_ds, bs, shuffle=False, num_workers=1) if test_ds is not None else None
@@ -66,30 +68,31 @@ class UnDBSColumnarModelData(ModelData):
         model = MixedInputModel(emb_szs, n_cont, emb_drop, out_sz, szs, drops, y_range, use_bn, self.is_reg, self.is_multi)
         return StructuredLearner(self, StructuredModel(to_gpu(model)), opt_fn=optim.Adam, **kwargs)
 
-def get_MD(trn, val, datapath, path):
-
-    tfms = (trn_tfms, val_tfms)
+def get_MD(trn, val, tfms, bs, datapath, path):
+    #tfms = (trn_tfms, val_tfms)
     
     datasets = ImageData.get_ds(
         UnsupFilesDataset,
         (trn, None),
         (val, None),
         tfms, path=datapath)
+    
     md = UnShuffleImageData(
         path,
         datasets,
         bs, num_workers=16,
         classes=None)
     
-    return md    
+    return md
 
-def get_cam(trn_cam, val_cam):
+def get_cam(trn_cam, val_cam, bs):
     return UnDBSColumnarModelData.from_data_frames(
         path= None,
         trn_df=trn_cam, val_df=val_cam,
         trn_y=None, val_y=None,
         cat_flds=[],
         bs=bs, shuffle=False)
+
 
 def denormer(mean, std):
     def denorm(imgs):
@@ -118,9 +121,9 @@ def toMD(train, val, bs, stats):
 def shuffle(dataframe):
     for i in range(4):
         dataframe = dataframe.sample(frac=1)
-    return dataframe.reset_index(drop=True, inplace=True)
-    
-def plot_img(recon, index=0, denorm, figsize=(12,4)):
+    return dataframe.reset_index(drop=True)
+
+def plot_img(recon, index, denorm, figsize=(12,4)):
     recon = denorm(recon)[index]
     plt.figure(figsize=figsize)
     plt.imshow(recon)
@@ -138,7 +141,7 @@ def plot_depth(depths, index=0, figsize=(12,4), scale=50, inv=False):
     plt.figure(figsize=figsize)
     plt.imshow(
         depth*scale,
-        cmap="viridis",
+        cmap="jet",
         #vmin=max(m - 2*std, 0),
         #vmax=min(m+2*std, mx)
     )
@@ -152,3 +155,14 @@ def plot_mask(masks, index=0, figsize=(12,4)):
     plt.imshow(mask.cpu().data.numpy(),cmap="gray", vmin=0, vmax=1)
     plt.colorbar()
     plt.axis('off')
+    
+def tonp(tensor):
+    return tensor.cpu().data.numpy()
+    
+def save_res(img, recon, depth, path):
+    fig, axs = plt.subplots(3,1)
+    for i in range(3): axs[i].set_axis_off()
+    axs[0].imshow(depth, cmap="jet", vmin=0, vmax=25)
+    axs[1].imshow(img)
+    axs[2].imshow(recon)
+    fig.savefig(path)
