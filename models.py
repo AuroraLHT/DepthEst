@@ -2,16 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pytorch_ssim import SSIM
-
 import fastai
 from fastai.conv_learner import *
 
 # part of architecture is copied from fastai library
 
 # transfer learning from pretrain resnet34
-MIN_DISP = 0.01
-DISP_SCALING = 10
 
 EPS = 1e-10
 f = resnet34
@@ -46,11 +42,29 @@ class SaveFeatures():
     def remove(self): self.hook.remove()
 
 
+class Conv(nn.Module):
+    def __init__(self, input_nc, output_nc, kernel_size, stride, padding, activation_func=nn.ELU()):
+        super(Conv, self).__init__()
+        self.conv = nn.Conv2d(in_channels=input_nc,
+                              out_channels=output_nc,
+                              kernel_size=kernel_size,
+                              stride=stride,
+                              padding=0,
+                              bias=True)
+        self.activation_fn = activation_func
+        self.pad_fn = nn.ReplicationPad2d(padding)
+
+    def forward(self, input):
+        if self.activation_fn == None:
+            return self.conv(self.pad_fn(input))
+        else:
+            return self.activation_fn(self.conv(self.pad_fn(input)))
+
 class UnetBlock(nn.Module):
     def __init__(self, up_in, x_in, n_out):
         super().__init__()
         up_out = x_out = n_out//2
-        self.x_conv  = nn.Conv2d(x_in,  x_out, 1)
+        self.x_conv  = nn.Conv2d(x_in, x_out, 1)
         self.tr_conv = nn.ConvTranspose2d(up_in, up_out, 2, stride=2)
         self.bn = nn.BatchNorm2d(n_out)
 
@@ -59,22 +73,17 @@ class UnetBlock(nn.Module):
         x_p = self.x_conv(x_p)
         cat_p = torch.cat([up_p,x_p], dim=1)
         return self.bn(F.relu(cat_p))
-"""
-class UnetBlock(nn.Module):
-    def __init__(self, up_in, x_in, n_out):
+
+class DepthFuseBlock(nn.Module):
+    def __init__(self):
         super().__init__()
-        up_out = x_out = n_out//2
-        self.x_conv = nn.Conv2d(x_in, x_out, 1)
-        self.tr_conv = nn.ConvTranspose2d(up_in, up_out, 2, bias=True, stride=2, padding=0)
-        #self.bn = nn.BatchNorm2d(n_out)
-        self.activation = nn.ELU()
-
-    def forward(self, up_p, x_p):
-        up_p = self.activation(self.tr_conv(up_p))
-        x_p = self.x_conv(x_p)
-        return torch.cat([up_p,x_p], dim=1)
-"""
-
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear')
+        self.cont = Conv(1, 1, 3, 1, 1, None)
+        self.fuse = Conv(2, 1, 3, 1, 1, nn.Sigmoid())
+    def forward(self, up_d, d):    
+        up_d = self.cont(self.up(up_d))
+        return self.fuse(torch.cat((up_d, d), dim=1))
+    
 class Pose(nn.Module):
     def __init__(self, inc, mag_scalor = 1):
         super().__init__()
@@ -90,10 +99,18 @@ class Pose(nn.Module):
             nn.Conv2d(128, self.ps*self.multi, 3, bias=True),
             nn.AdaptiveAvgPool2d((1,1))
         )
+        
+        self.tran_mag = 0.001
+        self.rot_mag= 0.01
+        
     def forward(self, x):
         x = self.body(x)
         batch, c, h, w = x.size()
-        return x.view(batch, self.multi, self.ps) * self.mag_scalor
+        x = x.view(batch, self.multi, self.ps)
+        
+        transistion = x[:, :, :3] * self.tran_mag
+        rotation = x[:, :, 3:] * self.rot_mag
+        return transistion, rotation
 
 class Depth34(nn.Module):
     def __init__(self, rn, ochannel):
@@ -104,38 +121,54 @@ class Depth34(nn.Module):
         self.up2 = UnetBlock(256,128,128)
         self.up3 = UnetBlock(128,64,64)
         self.up4 = UnetBlock(64,64,64)
-        self.up5 = UnetBlock(64,3,16) # this layer would make the model just copying the stuff from the pixel level
-#         self.up5 = nn.Sequential(
-#            nn.Upsample(scale_factor=2),
-#            nn.ReflectionPad2d(1),
-#            nn.Conv2d(64,16,3),
-#         )
-#         self.up1 = UnetBlock(512,256,256)
-#         self.up2 = UnetBlock(256,128,256)
-#         self.up3 = UnetBlock(256,64,256)
-#         self.up4 = UnetBlock(256,64,256)
-#         self.up5 = UnetBlock(256,3,16)
-        
-        self.up6 = nn.Conv2d(16, ochannel, 1, bias=False)    
-        #self.up6 = nn.ConvTranspose2d(16, ochannel, 1, bias=False)
-
-        self.op_norm = torch.nn.InstanceNorm2d(1)
+        self.up5 = UnetBlock(64,3,16) 
+        self.d1 =  Conv( 256, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
+        self.d2 =  Conv( 128, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
+        self.d3 =  Conv( 64, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
+        self.d4 =  Conv( 64, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
+        self.d5 =  Conv( 16, 1, 3, 1, 1, activation_func=nn.Sigmoid() )   
+        self.fuse2 = DepthFuseBlock()
+        self.fuse3 = DepthFuseBlock()
+        self.fuse4 = DepthFuseBlock()
+        self.fuse5 = DepthFuseBlock()
+        #self.op_norm = torch.nn.InstanceNorm2d(1)
     
-    def forward(self,x):
-        inp = x
-        x = F.elu(self.rn(x))
-        
-        x = self.up1(x, self.sfs[3].features)
-        x = self.up2(x, self.sfs[2].features)
-        x = self.up3(x, self.sfs[1].features)
-        x = self.up4(x, self.sfs[0].features)
-#         x = self.up5(x)
-        x = self.up5(x, inp)
-        x = self.up6(x)
-        
-        # return disparity map and the output of the encoder
-        return DISP_SCALING * F.sigmoid(x) + MIN_DISP, self.sfs[3].features #, x
+        self.MIN_DISP = 0.01
+        self.DISP_SCALING = 10
 
+    def forward(self, x, enc_only=False):
+        inp = x
+        x = F.elu(self.rn(x))        
+        depthmaps = []
+
+        if not enc_only:
+            x = self.up1(x, self.sfs[3].features)
+            d1 = self.d1(x)
+#             depthmaps.append(d1)
+            
+            x = self.up2(x, self.sfs[2].features)
+            d2 = self.fuse2( d1, self.d2(x) )
+#             depthmaps.append(d2)
+            
+            x = self.up3(x, self.sfs[1].features)
+            d3 = self.fuse3( d2, self.d3(x) )
+            depthmaps.append(d3)
+            
+            x = self.up4(x, self.sfs[0].features)
+            d4 = self.fuse4( d3, self.d4(x) )
+            depthmaps.append(d4)
+            
+            x = self.up5(x, inp)
+            d5 = self.fuse5( d4, self.d5(x) )
+            depthmaps.append(d5)
+            
+            depthmaps = [ d * self.DISP_SCALING + self.MIN_DISP for d in depthmaps ]
+                            
+            depthmaps.reverse()
+
+        # return disparity map and the output of the encoder
+        return depthmaps, self.sfs[3].features
+        # return DISP_SCALING * F.sigmoid(x) + MIN_DISP, self.sfs[3].features #, x
         #return F.sigmoid(x), self.sfs[3].features #, x
         #return F.sigmoid(self.op_norm(x)), self.sfs[3].features #, x
         #return 1/torch.clamp(F.relu(x), 0.1, 500), self.sfs[3].features 
@@ -145,18 +178,24 @@ class Depth34(nn.Module):
         for sf in self.sfs: sf.remove()
 
 class TriDepth(nn.Module):
-    def __init__(self, rn, ochannel):
+    def __init__(self, rn, ochannel, train=True):
         super().__init__()
         self.depth = Depth34(rn, ochannel) 
         self.pose = Pose(256*3)
-
+        self.train = train
+        
     def forward(self, x1, x2, x3):
-        d1, ft1 = self.depth(x1)
-        d2, ft2 = self.depth(x2) 
-        d3, ft3 = self.depth(x3)
-        poses_x2 = self.pose(torch.cat((ft1,ft2,ft3), dim=1))
+        if self.train:
+            d1, ft1 = self.depth(x1, enc_only=True) # src
+            d2, ft2 = self.depth(x2, enc_only=False) # target
+            d3, ft3 = self.depth(x3, enc_only=True) # src
+        else:
+            d1, ft1 = self.depth(x1, enc_only=False) # src
+            d2, ft2 = self.depth(x2, enc_only=False) # target
+            d3, ft3 = self.depth(x3, enc_only=False) # src            
+        trans, rotation = self.pose(torch.cat((ft1,ft2,ft3), dim=1))
 
-        return d1, d2, d3, poses_x2
+        return d1, d2, d3, trans, rotation
 
 class TriDepthModel():
     def __init__(self,model,name='tridepth'):
@@ -247,7 +286,6 @@ class Offset(nn.Module):
         dmask = V((thxyz[:, 2].data>EPS).type_as(inv_depth.data))
 
         return tkx, tky, dmask
-
 
 class Offset2(nn.Module):
     '''
@@ -349,8 +387,6 @@ class Offset2(nn.Module):
         dmask = V((t_xyz[:, 2].data>EPS).type_as(inv_depth.data)) 
         return t_kx, t_ky, dmask
 
-    
-
 class Offset3(nn.Module):
     '''
         xnew = Rx + td
@@ -382,10 +418,10 @@ class Offset3(nn.Module):
         K = torch.cat((o, -K2, K1, K2, o, K0, -K1, K0, o), 1).view(-1, 3, 3) # form a cpro matrix
         return eye + K * angles.sin() + torch.bmm(K,K) * (1-angles.cos()) # using the R formular
     
-    def pose_vec2mat(self, pose):
-        b = pose.size(0)
-        rot_vecs = pose[:,:3]
-        tran_vecs = pose[:, 3:]
+    def pose_vec2mat(self, trans, rotation):
+        b = trans.size(0)
+        rot_vecs = rotation
+        tran_vecs = trans
 
         rot_mats = self.rot_vec2mat(rot_vecs)
 
@@ -400,14 +436,17 @@ class Offset3(nn.Module):
         inv_depth = inv_depth.permute(0,2,3,1)
         pixel_coors = pixel_coors.unsqueeze(-1)
         inv_intrinsics = inv_intrinsics.unsqueeze(1).unsqueeze(2)
+        
         cam_coors = torch.matmul(inv_intrinsics, pixel_coors).squeeze(-1)
-                
+        #pdb.set_trace()
+        # cam_coors = cam_coors * inv_depth
         cam_coors = cam_coors / inv_depth
         if ishomo:
             cam_coors = torch.cat((cam_coors, V(torch.ones(b, h, w, 1))), dim=-1)
         return cam_coors
     
     def cam2pixel(self, cam_coords, proj):
+        
         b, h, w, c = cam_coords.size()
         proj = proj.unsqueeze(1).unsqueeze(2)
         cam_coords = cam_coords.unsqueeze(-1)
@@ -424,18 +463,18 @@ class Offset3(nn.Module):
         #pdb.set_trace()
         return x_n, y_n, V(z_u.data>EPS)
     
-    def forward(self, pose, inv_depth, camera):
+    def forward(self, trans, rotation, inv_depth, camera):
         
         """
             Params:
                 pose: relative pose, N X 6 vectors,
                     1-3 is the transition vector
-                    4-6 is the rotation vector
+                    4-6 is the rotation vector in eular representation
                 inv_depth: invered depth map
                 camera: intrinsic camera parameters NX4: (fx, fy, cx, cy)
             Return:
-                tkx: transformed camera pixel points - x-component
-                tky: transformed camera pixel points - y-component
+                tkx: transformed camera pixel coordinate - x-component
+                tky: transformed camera pixel coordinate - y-component
                 dmask: binary map of pixel that keeps track in the future
         """
         b, c, h, w = inv_depth.size()
@@ -457,13 +496,12 @@ class Offset3(nn.Module):
         inv_intrinsics = torch.cat(
             [1/fx, o, -cx/fx,
              o, 1/fy, -cy/fy,
-             o, o, o+1], dim=-1
-        ).view(b,3,3)
+             o, o, o+1], dim=-1).view(b,3,3)
         
         intrinsics = V(intrinsics)
         inv_intrinsics = V(inv_intrinsics)
 
-        pose = self.pose_vec2mat(pose)
+        pose = self.pose_vec2mat(trans, rotation)
        
         # grip points preperation
         px, py = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
@@ -475,7 +513,7 @@ class Offset3(nn.Module):
         proj_tgt_cam_to_src_pixel = torch.matmul(intrinsics, pose)
         #pdb.set_trace()
         x_n, y_n, dmask = self.cam2pixel(cam_coords, proj_tgt_cam_to_src_pixel)
-
+        #pdb.set_trace()
         return x_n, y_n, dmask.type_as(inv_depth)
     
 class BilinearProj(nn.Module):
@@ -544,70 +582,58 @@ def ssim_loss(img0, img1, mask):
     SSIM = F.pad(SSIM, (w,w,h,h), mode='constant', value=0)
     return torch.mean(
         torch.sum(
-            torch.sum(torch.abs(SSIM*mask).view(b, c, -1), dim=-1 )/(1+torch.sum(mask.view(b, 1, -1), dim=-1)), 
+            torch.sum((SSIM*mask).view(b, c, -1), dim=-1)/(1+torch.sum(mask.view(b, 1, -1), dim=-1)), 
             dim = -1
         )
     )
 
 class TriAppearanceLoss(nn.Module):
-    def __init__(self, scale=0.5, ws=11, ndown=2):
+    def __init__(self, scale=0.5):
         super().__init__()
         self.offset = Offset3()
         self.sampler = BilinearProj()
 
-        self.SSIM = SSIM(window_size = ws)
-        self.scale = scale
-        
-        self.ndown = ndown
-        # chan pyramid num
-        self.maskds = ImagePyramidLayer(1, 1)
-        self.imgds = ImagePyramidLayer(3, 1)
-        
-    def forward(self, d1, d3, poses_x2, x1, x2, x3, camera):
+#         self.offset2 = Offset3()
+#         self.sampler2 = BilinearProj()
 
-        cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
-        cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
-
-        #cx12, cy12, d_mask12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
-        #cx32, cy32, d_mask32 = self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
-        #cx12, cy12 = self.offset.forward(pose = poses_x2[:,0], inv_depth = d1, camera = camera)
-        #cx32, cy32= self.offset.forward(pose = poses_x2[:,1], inv_depth = d3, camera = camera)
-
-        #x12 = self.sampler.forward(x1, cx12, cy12)
-        #x32 = self.sampler.forward(x3, cx32, cy32)
         
-        x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
-        x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
+        self.scale = scale        
+        #self.imgds = DownSampleLayer(chan=3)
+        #self.depthus = nn.Upsample(scale_factor=2, mode='bilinear')
+        
+    def forward(self, d2s, trans, rotation, x1, x2, x3, camera):
+        l1losses = []
+        ssimlosses = []
+        for i, d2 in enumerate(d2s):            
+            if i>0: d2 = F.upsample(input=d2, scale_factor=2**i, mode='bilinear')
+            
+            cx12, cy12, d_mask12 = self.offset.forward(trans[:, 0], rotation[:, 0], inv_depth = d2, camera = camera)
+            #cx32, cy32, d_mask32 = self.offset.forward(trans[:, 1], rotation[:, 1], inv_depth = d2, camera = camera)
+            #cx32, cy32, d_mask32 = self.offset2.forward(trans[:, 1], rotation[:, 1], inv_depth = d2, camera = camera)
 
-        # mask12 = in_mask12.unsqueeze(1)
-        # mask32 = in_mask32.unsqueeze(1)
-        mask12 = (d_mask12*in_mask12).unsqueeze(1)
-        mask32 = (d_mask32*in_mask32).unsqueeze(1)
-        
-        mask12.requires_grad = False
-        mask32.requires_grad = False
-        
-        # print(type(x12))
-        # print(type(x2m12))
-        
-        # loss on original scale
-        ssimloss = ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32)
-        l1loss = l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32)
-        
-        for i in range(self.ndown):
-            x12, x2, x32 = self.imgds.downsample(x12), self.imgds.downsample(x2), self.imgds.downsample(x32)
-            mask12, mask32 = self.maskds.downsample(mask12), self.maskds.downsample(mask32)
+            x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
+#             x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
+#             x32, in_mask32 = self.sampler2.forward(x3, cx32, cy32)
 
-            #ssimloss += ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32)
-            l1loss += l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32)
-
-        mul = self.ndown+1
-        # ssimloss = ssimloss/mul 
-        l1loss = l1loss/mul
+            mask12 = (d_mask12*in_mask12).unsqueeze(1)
+#             mask32 = (d_mask32*in_mask32).unsqueeze(1)
+            
+            mask12.requires_grad = False
+#             mask32.requires_grad = False
+            
+            # loss on original scale
+            l1losses.append(l1_loss(x12, x2, mask12))
+            ssimlosses.append(ssim_loss(x12, x2, mask12))       
+            
+#             l1losses.append( l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32) )
+#             ssimlosses.append( ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32) )       
         
-        return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
-        #return ssimloss + self.scale * l1loss, (ssimloss, l1loss)
+        l1loss = torch.mean(torch.cat(l1losses, dim=0))
+        ssimloss = torch.mean(torch.cat(ssimlosses, dim=0))
 
+        return (1-self.scale) * ssimloss + self.scale * l1loss, ((1-self.scale) * ssimloss, self.scale * l1loss)
+        #return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
+        
 
 class SmoothLoss(nn.Module):
     def __init__(self):
@@ -646,51 +672,16 @@ class LaplacianLayer(nn.Module):
                 stride=1,
                 padding=0
             )
-            
-            # x_den = x.std() + 1e-5
-            
+                      
             x = (x_nom.abs()/x_den)
         else:
             x = x_nom.abs()
             
         return x.view(input_size[0], input_size[1], input_size[2]-2, input_size[3]-2)
 
-        
-#     def forward(self, input, do_normalize=True):
-#         assert(input.dim() == 2 or input.dim()==3 or input.dim()==4)
-#         input_size = input.size()
-#         if input.dim()==4:
-#             x = input.view(input_size[0]*input_size[1], 1,
-#                             input_size[2], input_size[3])
-#         elif input.dim()==3:
-#             x = input.unsqueeze(1)
-#         else:
-#             x = input.unsqueeze(0).unsqueeze(0)
-#         x_nom = torch.nn.functional.conv2d(input=x,
-#                         weight=Variable(self.w_nom),
-#                         stride=1,
-#                         padding=0)
-#         if do_normalize:
-#             x_den = torch.nn.functional.conv2d(input=x,
-#                         weight=Variable(self.w_den),
-#                         stride=1,
-#                         padding=0)
-#             # x_den = x.std() + 1e-5
-#             x = (x_nom.abs()/x_den)
-#         else:
-#             x = x_nom.abs()
-#         if input.dim() == 4:
-#             return x.view(input_size[0], input_size[1], input_size[2]-2, input_size[3]-2)
-#         elif input.dim() == 3:
-#             return x.squeeze(1)
-#         elif input.dim() == 2:
-#             return x.squeeze(0).squeeze(0)
-
-
-class ImagePyramidLayer(nn.Module):
-    def __init__(self, chan, pyramid_layer_num):
-        super(ImagePyramidLayer, self).__init__()
-        self.pyramid_layer_num = pyramid_layer_num
+class DownSampleLayer(nn.Module):
+    def __init__(self, chan):
+        super().__init__()
         K = torch.FloatTensor([[0.0751,   0.1238,    0.0751],
                               [0.1238,   0.2042,    0.1238],
                               [0.0751,   0.1238,    0.0751]]).view(1, 1, 3, 3)
@@ -704,8 +695,7 @@ class ImagePyramidLayer(nn.Module):
         self.avg_pool_func = torch.nn.AvgPool2d(kernel_size=2, stride=2, padding=0)
         self.reflection_pad_func = torch.nn.ReflectionPad2d(1)
 
-
-    def downsample(self, input):
+    def forward(self, input):
         output_dim = input.dim()
         output_size = input.size()
         if output_dim==2:
@@ -735,27 +725,3 @@ class ImagePyramidLayer(nn.Module):
             x =  x.squeeze(1)
 
         return x
-
-
-    def forward(self, input, do_detach=True):
-        pyramid = [input]
-        for i in range(self.pyramid_layer_num-1):
-            img_d = self.downsample(pyramid[i])
-            if isinstance(img_d, Variable) and do_detach:
-                img_d = img_d.detach()
-            pyramid.append(img_d)
-            assert(np.ceil(pyramid[i].size(-1)/2) == img_d.size(-1))
-        return pyramid
-
-
-    def get_coords(self, imH, imW):
-        x_pyramid = [np.arange(imW)+.5]
-        y_pyramid = [np.arange(imH)+.5]
-        for i in range(self.pyramid_layer_num-1):
-            offset = 2**i
-            stride = 2**(i+1)
-            x_pyramid.append(np.arange(offset, offset + stride*np.ceil(x_pyramid[i].shape[0]/2), stride))
-            y_pyramid.append(np.arange(offset, offset + stride*np.ceil(y_pyramid[i].shape[0]/2), stride))
-
-        return x_pyramid, y_pyramid
-

@@ -45,6 +45,12 @@ Eigen train-test split (references from various paper)
 Depth Map Prediction from a Single Image using a Multi-Scale Deep Network
 https://papers.nips.cc/paper/5539-depth-map-prediction-from-a-single-image-using-a-multi-scale-deep-network.pdf
 
+4.2 KITTI
+The KITTI dataset [3] is composed of several outdoor scenes captured while driving with carmounted
+cameras and depth sensor. We use 56 scenes from the “city,” “residential,” and “road”
+categories of the raw data. These are split into 28 for training and 28 for testing. The RGB images
+are originally 1224x368, and downsampled by half to form the network inputs.
+
 (https://arxiv.org/pdf/1806.01260.pdf)
 Predicting Depth, Surface Normals and Semantic Labels with a Common Multi-Scale Convolutional Architecture
 https://arxiv.org/pdf/1411.4734.pdf
