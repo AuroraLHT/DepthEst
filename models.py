@@ -5,6 +5,8 @@ import torch.nn.functional as F
 import fastai
 from fastai.conv_learner import *
 
+from math import exp
+
 # part of architecture is copied from fastai library
 
 # transfer learning from pretrain resnet34
@@ -30,9 +32,12 @@ def meshgrid(x ,y):
     Y = y.unsqueeze(1).repeat(1, imW)
     return X, Y
 
-def get_base():
+def get_base(f, cut):
     layers = cut_model(f(True), cut)
     return nn.Sequential(*layers)
+
+def get_resnet():
+    return get_base(f, cut)
 
 # a warped forward hook 
 class SaveFeatures():
@@ -77,7 +82,8 @@ class UnetBlock(nn.Module):
 class DepthFuseBlock(nn.Module):
     def __init__(self):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear')
+        self.up = nn.ConvTranspose2d(1, 1, 2, 2)
+        #self.up = nn.Upsample(scale_factor=2, mode='bilinear')
         self.cont = Conv(1, 1, 3, 1, 1, None)
         self.fuse = Conv(2, 1, 3, 1, 1, nn.Sigmoid())
     def forward(self, up_d, d):    
@@ -118,19 +124,19 @@ class Depth34(nn.Module):
         self.rn = rn
         self.sfs = [SaveFeatures(rn[i]) for i in [2,4,5,6]]
         self.up1 = UnetBlock(512,256,256)
-        self.up2 = UnetBlock(256,128,128)
-        self.up3 = UnetBlock(128,64,64)
-        self.up4 = UnetBlock(64,64,64)
-        self.up5 = UnetBlock(64,3,16) 
+        self.up2 = UnetBlock(256+1,128,128)
+        self.up3 = UnetBlock(128+1,64,64)
+        self.up4 = UnetBlock(64+1,64,64)
+        self.up5 = UnetBlock(64+1,3,16) 
         self.d1 =  Conv( 256, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d2 =  Conv( 128, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d3 =  Conv( 64, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d4 =  Conv( 64, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d5 =  Conv( 16, 1, 3, 1, 1, activation_func=nn.Sigmoid() )   
-        self.fuse2 = DepthFuseBlock()
-        self.fuse3 = DepthFuseBlock()
-        self.fuse4 = DepthFuseBlock()
-        self.fuse5 = DepthFuseBlock()
+#        self.fuse2 = DepthFuseBlock()
+#        self.fuse3 = DepthFuseBlock()
+#        self.fuse4 = DepthFuseBlock()
+#        self.fuse5 = DepthFuseBlock()
         #self.op_norm = torch.nn.InstanceNorm2d(1)
     
         self.MIN_DISP = 0.01
@@ -146,20 +152,28 @@ class Depth34(nn.Module):
             d1 = self.d1(x)
 #             depthmaps.append(d1)
             
+            x = torch.cat((x, d1), dim=1)
             x = self.up2(x, self.sfs[2].features)
-            d2 = self.fuse2( d1, self.d2(x) )
+#            d2 = self.fuse2( d1, self.d2(x) )
+            d2 = self.d2(x)
 #             depthmaps.append(d2)
             
+            x = torch.cat((x, d2), dim=1)
             x = self.up3(x, self.sfs[1].features)
-            d3 = self.fuse3( d2, self.d3(x) )
-            depthmaps.append(d3)
+#            d3 = self.fuse3( d2, self.d3(x) )
+            d3 = self.d3(x)        
+#             depthmaps.append(d3)
             
+            x = torch.cat((x, d3), dim=1)
             x = self.up4(x, self.sfs[0].features)
-            d4 = self.fuse4( d3, self.d4(x) )
-            depthmaps.append(d4)
+#            d4 = self.fuse4( d3, self.d4(x) )
+            d4 = self.d4(x)
+#             depthmaps.append(d4)
             
+            x = torch.cat((x, d4), dim=1)
             x = self.up5(x, inp)
-            d5 = self.fuse5( d4, self.d5(x) )
+#             d5 = self.fuse5( d4, self.d5(x) )
+            d5 = self.d5(x)
             depthmaps.append(d5)
             
             depthmaps = [ d * self.DISP_SCALING + self.MIN_DISP for d in depthmaps ]
@@ -554,8 +568,15 @@ class BilinearProj(nn.Module):
         return sampled, in_view_mask
 
 def l1_loss(x1, x2, mask):
-    return torch.sum(torch.abs(mask*(x1-x2)))/(torch.sum(mask)+1) 
-
+#     size = mask.size()
+#     masksum = mask.view(size[0], size[1], -1).sum(-1, keepdim=True) + 1
+#     diffs = torch.abs(mask*(x1-x2)).view(size[0], size[1], -1).sum(-1, keepdim=True)
+#     diffs = torch.sum(diffs/masksum, 1)
+#     return torch.mean(diffs)
+    return F.l1_loss(x1, x2)
+    
+    
+"""
 def compute_img_stats(img):
     # img_pad = torch.nn.ReplicationPad2d(1)(img)
     img_pad = img
@@ -591,6 +612,77 @@ def ssim_loss(img0, img1, mask):
             dim = -1
         )
     )
+"""
+
+# Copy from pytorch_ssim repo
+
+def gaussian(window_size, sigma):
+    gauss = torch.Tensor([exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
+    return gauss/gauss.sum()
+
+def create_window(window_size, channel):
+    _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+    #  filters tensor (out_channels x in_channels/groups x kH x kW)
+    window = V(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
+    return window
+
+def _ssim(img1, img2, mask, window, window_size, channel, size_average = True):
+    mu1 = F.conv2d(img1*mask, window, padding = window_size//2, groups = channel)
+    mu2 = F.conv2d(img2*mask, window, padding = window_size//2, groups = channel)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1*mu2
+
+    sigma1_sq = F.conv2d(img1*img1, window, padding = window_size//2, groups = channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2*img2, window, padding = window_size//2, groups = channel) - mu2_sq
+    sigma12 = F.conv2d(img1*img2, window, padding = window_size//2, groups = channel) - mu1_mu2
+
+    C1 = 0.01**2
+    C2 = 0.03**2
+
+    ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+    ssim_map = 1 - ssim_map
+#    size = mask.size()
+#    masksum = mask.view(size[0], size[1], -1).sum(-1, keepdim=False) + 1
+#     pdb.set_trace()
+#    ssim_map = ssim_map.view(size[0], size[1], -1).sum(-1, keepdim=False)
+#     pdb.set_trace()
+#    ssim_map = (ssim_map/masksum).sum(-1, keepdim=False)
+#     pdb.set_trace()
+#    return torch.mean(ssim_map)
+    
+    if size_average:
+        return ssim_map.mean()
+    else:
+        return ssim_map.mean(1).mean(1).mean(1)
+
+class SSIM(nn.Module):
+    def __init__(self, window_size = 11, channel = 3, size_average = True):
+        super().__init__()
+        self.window_size = window_size
+        self.size_average = size_average
+        self.channel = channel
+        #self.window = create_window(window_size, self.channel)
+        self.register_buffer('window', create_window(window_size, self.channel) )
+
+    def forward(self, img1, img2, mask):
+        (_, channel, _, _) = img1.size()
+
+        #if channel == self.channel and self.window.data.type() == img1.data.type():
+        #    window = self.window
+        #else:
+        #    window = create_window(self.window_size, channel)
+           
+        #    if img1.is_cuda:
+        #        window = window.cuda(img1.get_device())
+        #    window = window.type_as(img1)
+           
+        #    self.window = window
+        #    self.channel = channel
+        return _ssim(img1, img2, mask, self.window, self.window_size, self.channel, self.size_average)
+
 
 class TriAppearanceLoss(nn.Module):
     def __init__(self, scale=0.5):
@@ -603,6 +695,8 @@ class TriAppearanceLoss(nn.Module):
 
         
         self.scale = scale        
+        self.ssim_loss = SSIM()
+        self.l1_loss = l1_loss
         #self.imgds = DownSampleLayer(chan=3)
         #self.depthus = nn.Upsample(scale_factor=2, mode='bilinear')
         
@@ -627,11 +721,11 @@ class TriAppearanceLoss(nn.Module):
 #             mask32.requires_grad = False
             
             # loss on original scale
-            l1losses.append(l1_loss(x12, x2, mask12))
-            ssimlosses.append(ssim_loss(x12, x2, mask12))       
+            l1losses.append(self.l1_loss(x12, x2, mask12))
+            ssimlosses.append(self.ssim_loss(x12, x2, mask12))       
             
-#             l1losses.append( l1_loss(x12, x2, mask12) + l1_loss(x32, x2, mask32) )
-#             ssimlosses.append( ssim_loss(x12, x2, mask12) + ssim_loss(x32, x2, mask32) )       
+#             l1losses.append( self.l1_loss(x12, x2, mask12) + self.l1_loss(x32, x2, mask32) )
+#             ssimlosses.append( self.ssim_loss(x12, x2, mask12) + self.ssim_loss(x32, x2, mask32) )       
         
         l1loss = torch.mean(torch.cat(l1losses, dim=0))
         ssimloss = torch.mean(torch.cat(ssimlosses, dim=0))
@@ -730,3 +824,11 @@ class DownSampleLayer(nn.Module):
             x =  x.squeeze(1)
 
         return x
+
+class PerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.perceptor = get_base(f, 2)
+        
+    def forward(self, x1, x2):
+        return torch.mse(self.perceptor(x1)-self.perceptor(x2))

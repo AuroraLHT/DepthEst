@@ -95,8 +95,8 @@ def get_cam(trn_cam, val_cam, bs):
 
 
 def denormer(mean, std):
-    def denorm(imgs):
-        return V(imgs.cpu().data * std + mean)
+    def denorm(imgs, **kargs):
+        return V(imgs.cpu().data * std + mean, **kargs)
     return denorm
 
 """
@@ -159,10 +159,11 @@ def plot_mask(masks, index=0, figsize=(12,4)):
 def tonp(tensor):
     return tensor.cpu().data.numpy()
     
-def save_res(img, recon, depth, path):
-    fig, axs = plt.subplots(3,1)
+def save_res(img, recon, depth, path, figsize=(12,12)):
+    fig, axs = plt.subplots(3,1, figsize=figsize)
     for i in range(3): axs[i].set_axis_off()
-    axs[0].imshow(depth, cmap="jet", vmin=0, vmax=25)
+    axs[0].imshow(depth, cmap="jet") #,  vmin=1, vmax=10)
     axs[1].imshow(img)
     axs[2].imshow(recon)
     fig.savefig(path)
+    plt.close(fig)
