@@ -91,18 +91,25 @@ class DepthFuseBlock(nn.Module):
         return self.fuse(torch.cat((up_d, d), dim=1))
     
 class Pose(nn.Module):
+
+
     def __init__(self, inc, mag_scalor = 1):
+        """
+            According to the "Digging Into Self-Supervised Monocular Depth Estimation", the pose decoder should be the same as the last three layer
+            of the pose net defined in https://github.com/tinghuiz/SfMLearner/blob/master/nets.py line:18 
+            def pose_exp_net(tgt_image, src_image_stack, do_exp=True, is_training=True)
+        """
         super().__init__()
         self.ps = 6
         self.multi = 2
         self.mag_scalor = mag_scalor
 
         self.body = nn.Sequential(
-            nn.Conv2d(inc, 128, 3, stride=1, padding=0, bias=True),
+            nn.Conv2d(inc, 256, 3, stride=2, padding=0, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, stride=1, padding=0, bias=True),
+            nn.Conv2d(256, 256, 3, stride=2, padding=0, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, self.ps*self.multi, 3, bias=True),
+            nn.Conv2d(256, self.ps*self.multi, 1, bias=True), # set biad = True would make the model remember the processing speed in non-shuffle training set
             nn.AdaptiveAvgPool2d((1,1))
         )
         
@@ -127,17 +134,19 @@ class Depth34(nn.Module):
         self.up2 = UnetBlock(256+1,128,128)
         self.up3 = UnetBlock(128+1,64,64)
         self.up4 = UnetBlock(64+1,64,64)
-        self.up5 = UnetBlock(64+1,3,16) 
+        # self.up5 = UnetBlock(64+1,3,16)
+        self.up5 = nn.ConvTranspose(64+1, 16, 2, stride=2) 
+
         self.d1 =  Conv( 256, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d2 =  Conv( 128, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d3 =  Conv( 64, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d4 =  Conv( 64, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d5 =  Conv( 16, 1, 3, 1, 1, activation_func=nn.Sigmoid() )   
-#        self.fuse2 = DepthFuseBlock()
-#        self.fuse3 = DepthFuseBlock()
-#        self.fuse4 = DepthFuseBlock()
-#        self.fuse5 = DepthFuseBlock()
-        #self.op_norm = torch.nn.InstanceNorm2d(1)
+    #    self.fuse2 = DepthFuseBlock()
+    #    self.fuse3 = DepthFuseBlock()
+    #    self.fuse4 = DepthFuseBlock()
+    #    self.fuse5 = DepthFuseBlock()
+    #     self.op_norm = torch.nn.InstanceNorm2d(1)
     
         self.MIN_DISP = 0.01
         self.DISP_SCALING = 10
