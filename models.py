@@ -9,10 +9,11 @@ from math import exp
 
 # part of architecture is copied from fastai library
 
-# transfer learning from pretrain resnet34
+# transfer learning from pretrain resnet34 or resnet18
 
 EPS = 1e-10
-f = resnet34
+# f = resnet34
+f = resnet18
 cut,lr_cut = model_meta[f]
 
 def meshgrid_fromHW(H, W, dtype=torch.FloatTensor):
@@ -79,20 +80,7 @@ class UnetBlock(nn.Module):
         cat_p = torch.cat([up_p,x_p], dim=1)
         return self.bn(F.relu(cat_p))
 
-class DepthFuseBlock(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(1, 1, 2, 2)
-        #self.up = nn.Upsample(scale_factor=2, mode='bilinear')
-        self.cont = Conv(1, 1, 3, 1, 1, None)
-        self.fuse = Conv(2, 1, 3, 1, 1, nn.Sigmoid())
-    def forward(self, up_d, d):    
-        up_d = self.cont(self.up(up_d))
-        return self.fuse(torch.cat((up_d, d), dim=1))
-    
 class Pose(nn.Module):
-
-
     def __init__(self, inc, mag_scalor = 1):
         """
             According to the "Digging Into Self-Supervised Monocular Depth Estimation", the pose decoder should be the same as the last three layer
@@ -109,7 +97,7 @@ class Pose(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 256, 3, stride=2, padding=0, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, self.ps*self.multi, 1, bias=True), # set biad = True would make the model remember the processing speed in non-shuffle training set
+            nn.Conv2d(256, self.ps*self.multi, 1, bias=True), # set biad = True would make the model remember the common driving speed in non-shuffle training set
             nn.AdaptiveAvgPool2d((1,1))
         )
         
@@ -135,7 +123,10 @@ class Depth34(nn.Module):
         self.up3 = UnetBlock(128+1,64,64)
         self.up4 = UnetBlock(64+1,64,64)
         # self.up5 = UnetBlock(64+1,3,16)
-        self.up5 = nn.ConvTranspose(64+1, 16, 2, stride=2) 
+        self.up5 = nn.Sequential(
+            nn.ConvTranspose2d(64+1, 16, 2, stride=2),
+            nn.ELU(inplace=True)
+        )
 
         self.d1 =  Conv( 256, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
         self.d2 =  Conv( 128, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
@@ -200,10 +191,80 @@ class Depth34(nn.Module):
     def close(self):
         for sf in self.sfs: sf.remove()
 
+class Depth18(nn.Module):
+    def __init__(self, rn, ochannel):
+        super().__init__()
+        self.rn = rn
+        self.sfs = [SaveFeatures(rn[i]) for i in [2,4,5,6]]
+        self.up1 = UnetBlock(256,256,256)
+        self.up2 = UnetBlock(128+1,128,128)
+        self.up3 = UnetBlock(64+1,64,64)
+        self.up4 = UnetBlock(64+1,64,64)
+        # self.up5 = UnetBlock(64+1,3,16)
+        self.up5 = nn.Sequential(
+            nn.ConvTranspose2d(64+1, 16, 2, stride=2),
+            nn.ELU(inplace=True)
+        )
+
+        self.d1 =  Conv( 256, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
+        self.d2 =  Conv( 128, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
+        self.d3 =  Conv( 64, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
+        self.d4 =  Conv( 64, 1, 3, 1, 1, activation_func=nn.Sigmoid() )
+        self.d5 =  Conv( 16, 1, 3, 1, 1, activation_func=nn.Sigmoid() )   
+    
+        self.MIN_DISP = 0.01
+        self.DISP_SCALING = 10
+
+    def forward(self, x, enc_only=False):
+        inp = x
+        x = F.elu(self.rn(x))        
+        depthmaps = []
+
+        if not enc_only:
+            x = self.up1(x, self.sfs[3].features)
+            d1 = self.d1(x)
+#             depthmaps.append(d1)
+            
+            x = torch.cat((x, d1), dim=1)
+            x = self.up2(x, self.sfs[2].features)
+#            d2 = self.fuse2( d1, self.d2(x) )
+            d2 = self.d2(x)
+#             depthmaps.append(d2)
+            
+            x = torch.cat((x, d2), dim=1)
+            x = self.up3(x, self.sfs[1].features)
+#            d3 = self.fuse3( d2, self.d3(x) )
+            d3 = self.d3(x)        
+#             depthmaps.append(d3)
+            
+            x = torch.cat((x, d3), dim=1)
+            x = self.up4(x, self.sfs[0].features)
+#            d4 = self.fuse4( d3, self.d4(x) )
+            d4 = self.d4(x)
+#             depthmaps.append(d4)
+            
+            x = torch.cat((x, d4), dim=1)
+            X = self.up5(x)
+#             x = self.up5(x, inp)
+#             d5 = self.fuse5( d4, self.d5(x) )
+            d5 = self.d5(x)
+            depthmaps.append(d5)
+            
+            depthmaps = [ d * self.DISP_SCALING + self.MIN_DISP for d in depthmaps ]
+                            
+            depthmaps.reverse()
+
+        return depthmaps, self.sfs[3].features
+
+    
+    def close(self):
+        for sf in self.sfs: sf.remove()            
+            
 class TriDepth(nn.Module):
     def __init__(self, rn, ochannel):
         super().__init__()
-        self.depth = Depth34(rn, ochannel) 
+        self.depth = Depth18(rn, ochannel) 
+#         self.depth = Depth34(rn, ochannel) 
         self.pose = Pose(256*3)
         #self.train = train
         
@@ -232,188 +293,6 @@ class TriDepthModel():
     def get_layer_groups(self, precompute):
         lgs = list(split_by_idxs(children(self.model.depth.rn), [lr_cut]))
         return lgs + [children(self.model.depth)[1:]] + [children(self.model.pose)]
-
-class Offset(nn.Module):
-    '''
-        xnew = Rx + td
-        where R is determined by camera relative pose change using Rodrigues Rotation Formular
-    '''
-    def __init__(self):
-        super().__init__()
-        self.register_buffer('o', torch.zeros([1,1]).type(torch.FloatTensor))
-        self.register_buffer('eye', torch.eye(3).type(torch.FloatTensor).unsqueeze(0))
-        
-    def factorize(self, vecs, dim):
-        mags = vecs.norm(p=2, dim=dim, keepdim=True)
-        return vecs/mags, mags
-
-    def rot_vec2mat(self, rot_vecs):
-        batch, _ = rot_vecs.size()
-        directs, angles = self.factorize(rot_vecs, 1)
-        
-        K0 = directs[:,:1]
-        K1 = directs[:,1:2]
-        K2 = directs[:,2:]
-        
-        o = V(self.o.repeat(batch, 1))
-        eye = V(self.eye.repeat(batch, 1, 1))
-        
-        #print(K0.type, K2.type, K1.type, o.type, eye.type)
-        angles = angles.unsqueeze(-1)
-        K = torch.cat((o, -K2, K1, K2, o, K0, -K1, K0, o), 1).view(-1, 3, 3) # form a cpro matrix
-        return eye + K * angles.sin() + torch.bmm(K,K) * (1-angles.cos()) # using the R formular
-    
-    def forward(self, pose, inv_depth, camera):
-        camera = camera.data
-        """
-            Params:
-                pose: relative pose, N X 6 vectors,
-                    1-3 is the transition vector
-                    4-6 is the rotation vector
-                inv_depth: invered depth map
-                camera: intrinsic camera parameters NX4: (fx, fy, cx, cy)
-            Return:
-                tkx: transformed camera pixel points - x-component
-                tky: transformed camera pixel points - y-component
-                dmask: binary map of pixel that keeps track in the future
-        """
-        batch, c, h, w = inv_depth.size()
-
-        cxy = camera[:, 2:].contiguous().view(batch, 1, 1, 2)
-        fxy = camera[:, :2].contiguous().view(batch, 1, 1, 2)
-
-        rot_vecs = pose[:,:3]
-        tran_vecs = pose[:, 3:]
-
-        rot_mats = self.rot_vec2mat(rot_vecs)
-
-        # grip points preperation
-        kx, ky = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
-        #kx, ky = kx+0.5, ky+0.5
-        kxy = torch.stack([kx, ky], dim=-1).repeat(batch, 1, 1, 1)
-        
-        hxy = (kxy - cxy)/fxy
-        hxy = V(hxy)
-        # transformation : Output Size NX3XHXW 
-        # calculate the transformed extended homogenerous coordinate(in projective space) of the camera screen
-        thxyz = torch.matmul(rot_mats[:, :, :2].unsqueeze(1).unsqueeze(2), hxy.unsqueeze(-1)).squeeze(-1).permute(0,3,1,2)
-        thxyz = thxyz + rot_mats[:, :, 2].unsqueeze(-1).unsqueeze(-1) 
-        thxyz = thxyz + tran_vecs.unsqueeze(-1).unsqueeze(-1) * inv_depth
-        
-        # project the pixel in "tilted" projective space to projective space       
-        thxy_warp = thxyz[:, :2] / thxyz[:, 2:].clamp(min=EPS)
-        
-        # projective space to camera space
-        cxy = V(cxy.view(batch, 2, 1, 1))
-        fxy = V(fxy.view(batch, 2, 1, 1))
-        
-        #tkxy = (thxy_warp * fxy) + cxy - V(kxy.permute(0,3,1,2))
-        tkxy = (thxy_warp * fxy) + cxy
-        tkx, tky = tkxy[:, 0], tkxy[:, 1]
-
-        dmask = V((thxyz[:, 2].data>EPS).type_as(inv_depth.data))
-
-        return tkx, tky, dmask
-
-class Offset2(nn.Module):
-    '''
-        xnew = Rx + td
-        where R is determined by camera relative pose change using Rodrigues Rotation Formular
-    '''
-    def __init__(self):
-        super().__init__()
-        self.register_buffer('o', torch.zeros([1,1]).type(torch.FloatTensor))
-        self.register_buffer('eye', torch.eye(3).type(torch.FloatTensor).unsqueeze(0))
-        self.register_buffer('filler', torch.FloatTensor([0,0,0,1]).unsqueeze(0))
-        
-    def factorize(self, vecs, dim):
-        mags = vecs.norm(p=2, dim=dim, keepdim=True)
-        return vecs/mags, mags
-
-    def rot_vec2mat(self, rot_vecs):
-        b, _ = rot_vecs.size()
-        directs, angles = self.factorize(rot_vecs, 1)
-        
-        K0 = directs[:,:1]
-        K1 = directs[:,1:2]
-        K2 = directs[:,2:]
-        
-        o = Variable(self.o.repeat(b, 1))
-        eye = Variable(self.eye.repeat(b, 1, 1))
-        
-        #print(K0.type, K2.type, K1.type, o.type, eye.type)
-        angles = angles.unsqueeze(-1)
-        K = torch.cat((o, -K2, K1, K2, o, K0, -K1, K0, o), 1).view(-1, 3, 3) # form a cpro matrix
-        return eye + K * angles.sin() + torch.bmm(K,K) * (1-angles.cos()) # using the R formular
-    
-    def forward(self, pose, inv_depth, camera):
-        camera = camera.data
-        """
-            Params:
-                pose: relative pose, N X 6 vectors,
-                    1-3 is the transition vector
-                    4-6 is the rotation vector
-                inv_depth: invered depth map
-                camera: intrinsic camera parameters NX4: (fx, fy, cx, cy)
-            Return:
-                tkx: transformed camera pixel points - x-component
-                tky: transformed camera pixel points - y-component
-                dmask: binary map of pixel that keeps track in the future
-        """
-        b, c, h, w = inv_depth.size()
-
-        cxy = camera[:, 2:].contiguous().view(b, 1, 1, 2)
-        fxy = camera[:, :2].contiguous().view(b, 1, 1, 2)
-
-        rot_vecs = pose[:,:3]
-        tran_vecs = pose[:, 3:]
-
-        rot_mats = self.rot_vec2mat(rot_vecs)
-
-        # grip points preperation
-        kx, ky = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
-        #kx, ky = kx+0.5, ky+0.5
-        kxy = torch.stack([kx, ky], dim=-1).repeat(b, 1, 1, 1)
-        
-        hxy = (kxy - cxy)/fxy
-        
-        # augment the homogeneous coordinate, add the 1 z dimension
-        hxy = torch.cat((hxy, torch.ones(b, h, w, 1).type_as(hxy)), dim=-1)
-        
-        hxy = V(hxy)
-        
-        # stack these trans together w.r.t the column
-        T = torch.cat((rot_mats, tran_vecs.unsqueeze(-1)), dim=-1)
-        T = torch.cat((T, V(self.filler).repeat(b, 1, 1) ), dim=-2)
-
-        # homogeneous space to real space
-        rxy = hxy / inv_depth.permute(0,2,3,1)
-
-        # augment the realspace xyz coordinate, add the 1 dimension for xyz transistion
-        rxy = torch.cat((rxy, V(torch.ones(b, h, w, 1))), dim=-1)
-
-        # transformation : Output Size NX3XHXW 
-        # calculate the transformed extended homogenerous coordinate(in projective space) of the camera screen
-        
-        # add dummy dimension for broadcasting
-        T = T.unsqueeze(1).unsqueeze(2)
-        rxy = rxy.unsqueeze(-1)
-
-        t_xyz = torch.matmul(T, rxy).squeeze(-1)
-        t_xyz = t_xyz.permute(0,3,1,2)
-
-        t_xy = t_xyz[:, :2] 
-        t_z = t_xyz[:, 2:3].clamp(min=EPS)
-        
-        # projective space to camera space
-        cxy = V(cxy.view(b, 2, 1, 1))
-        fxy = V(fxy.view(b, 2, 1, 1))        
-        t_kxy = ((t_xy * fxy) + cxy) / t_z
-        
-        # divided the result and return
-        t_kx, t_ky = t_kxy[:, 0], t_kxy[:, 1]
-        dmask = V((t_xyz[:, 2].data>EPS).type_as(inv_depth.data)) 
-        return t_kx, t_ky, dmask
 
 class Offset3(nn.Module):
     '''
@@ -584,44 +463,7 @@ def l1_loss(x1, x2, mask):
 #     return torch.mean(diffs)
     return F.l1_loss(x1, x2)
     
-    
-"""
-def compute_img_stats(img):
-    # img_pad = torch.nn.ReplicationPad2d(1)(img)
-    img_pad = img
-    mu = F.avg_pool2d(img_pad, kernel_size=3, stride=1, padding=0)
-    sigma = F.avg_pool2d(img_pad**2, kernel_size=3, stride=1, padding=0) - mu**2
-    return mu, sigma
 
-def compute_SSIM(img0, img1 ):
-    mu0, sigma0= compute_img_stats(img0) 
-    mu1, sigma1= compute_img_stats(img1)
-    # img0_img1_pad = torch.nn.ReplicationPad2d(1)(img0 * img1)
-    img0_img1_pad = img0*img1
-    sigma01 = F.avg_pool2d(img0_img1_pad, kernel_size=3, stride=1, padding=0) - mu0*mu1
-    # C1 = .01 ** 2
-    # C2 = .03 ** 2
-    C1 = .001
-    C2 = .009
-
-    ssim_n = (2*mu0*mu1 + C1) * (2*sigma01 + C2)
-    ssim_d = (mu0**2 + mu1**2 + C1) * (sigma0 + sigma1 + C2)
-    ssim = ssim_n / ssim_d
-    return ((1-ssim)*.5).clamp(0, 1)
-
-def ssim_loss(img0, img1, mask):
-    b, c, h, w = img0.size()
-    SSIM = compute_SSIM(img0, img1)
-    h = (mask.size(2) - SSIM.size(2))//2
-    w = (mask.size(3) - SSIM.size(3))//2
-    SSIM = F.pad(SSIM, (w,w,h,h), mode='constant', value=0)
-    return torch.mean(
-        torch.sum(
-            torch.sum((SSIM*mask).view(b, c, -1), dim=-1)/(1+torch.sum(mask.view(b, 1, -1), dim=-1)), 
-            dim = -1
-        )
-    )
-"""
 
 # Copy from pytorch_ssim repo
 
@@ -787,52 +629,6 @@ class LaplacianLayer(nn.Module):
             
         return x.view(input_size[0], input_size[1], input_size[2]-2, input_size[3]-2)
 
-class DownSampleLayer(nn.Module):
-    def __init__(self, chan):
-        super().__init__()
-        K = torch.FloatTensor([[0.0751,   0.1238,    0.0751],
-                              [0.1238,   0.2042,    0.1238],
-                              [0.0751,   0.1238,    0.0751]]).view(1, 1, 3, 3)
-        self.register_buffer('smooth_kernel', K)
-        if chan>1:
-            k = K
-            K = torch.zeros(chan, chan, 3, 3)
-            for i in range(chan):
-                K[i, i, :, :] = k
-        self.register_buffer('smooth_kernel_K', K)
-        self.avg_pool_func = torch.nn.AvgPool2d(kernel_size=2, stride=2, padding=0)
-        self.reflection_pad_func = torch.nn.ReflectionPad2d(1)
-
-    def forward(self, input):
-        output_dim = input.dim()
-        output_size = input.size()
-        if output_dim==2:
-            K = self.smooth_kernel
-            input = input.unsqueeze(0).unsqueeze(0)
-        elif output_dim==3:
-            K = self.smooth_kernel
-            input = input.unsqueeze(1)
-        else:
-            K = self.smooth_kernel_K
-
-        x = self.reflection_pad_func(input)
-
-        x = F.conv2d(input=x,
-                    weight=V(K),
-                    stride=1,
-                    padding=0)
-        # remove here if not work out
-        padding = [0, int(np.mod(input.size(-1), 2)), 0, int(np.mod(input.size(-2), 2))]
-        x = torch.nn.ReplicationPad2d(padding)(x)
-        # -----
-        x = self.avg_pool_func(x)
-
-        if output_dim==2:
-            x =  x.squeeze(0).squeeze(0)
-        elif output_dim==3:
-            x =  x.squeeze(1)
-
-        return x
 
 class PerceptualLoss(nn.Module):
     def __init__(self):

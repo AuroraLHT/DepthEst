@@ -13,7 +13,7 @@ SfMLeanrner
 https://github.com/tinghuiz/SfMLearner
 
 
- "Real-Time Monocular Depth Estimation using Synthetic Data with Domain Adaptation via Image Style Transfer". demo video
+"Real-Time Monocular Depth Estimation using Synthetic Data with Domain Adaptation via Image Style Transfer". demo video
 https://vimeo.com/260393753
 
 Image Quality Assessment: From Error Visibility to
@@ -40,18 +40,21 @@ pytorch-ssim
 https://github.com/Po-Hsun-Su/pytorch-ssim
 
 Eigen train-test split (references from various paper)
-
 (https://arxiv.org/pdf/1704.07813.pdf)
+
 Depth Map Prediction from a Single Image using a Multi-Scale Deep Network
 https://papers.nips.cc/paper/5539-depth-map-prediction-from-a-single-image-using-a-multi-scale-deep-network.pdf
 
+"""
 4.2 KITTI
 The KITTI dataset [3] is composed of several outdoor scenes captured while driving with carmounted
 cameras and depth sensor. We use 56 scenes from the “city,” “residential,” and “road”
 categories of the raw data. These are split into 28 for training and 28 for testing. The RGB images
 are originally 1224x368, and downsampled by half to form the network inputs.
+""" Cited from -> (https://arxiv.org/pdf/1806.01260.pdf)
 
-(https://arxiv.org/pdf/1806.01260.pdf)
+KITTI dataset paper: http://www.cvlibs.net/publications/Geiger2013IJRR.pdf
+
 Predicting Depth, Surface Normals and Semantic Labels with a Common Multi-Scale Convolutional Architecture
 https://arxiv.org/pdf/1411.4734.pdf
 

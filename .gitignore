@@ -2,8 +2,10 @@
 /tmp/*
 /.vscode
 !/.vscode/*
-/.ipynb_checkpoints
-!/.ipynb_checkpoints/*
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+**/*.ipynb_checkpoints/
+kittidata/.ipynb_checkpoints/*
 submit.bash
 __pycache__/*
 !__pycache__
