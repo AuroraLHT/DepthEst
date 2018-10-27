@@ -162,7 +162,7 @@ def tonp(tensor):
 def save_res(img, recon, depth, path, figsize=(12,12)):
     fig, axs = plt.subplots(3,1, figsize=figsize)
     for i in range(3): axs[i].set_axis_off()
-    axs[0].imshow(depth, cmap="jet") #,  vmin=1, vmax=10)
+    axs[0].imshow(depth, cmap="plasma") #,  vmin=1, vmax=10)
     axs[1].imshow(img)
     axs[2].imshow(recon)
     fig.savefig(path)

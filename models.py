@@ -16,6 +16,19 @@ EPS = 1e-10
 f = resnet18
 cut,lr_cut = model_meta[f]
 
+# the scalling factor for the disparity is one of the most misterious thing in the universe
+
+# Geonet use 5 for resnet50, 10 for vgg https://github.com/yzcjtr/GeoNet/blob/master/geonet_nets.py
+
+# Left-Right consistency use 0.3 ???
+
+# SfMLearner use 10 for vgg https://github.com/tinghuiz/SfMLearner/blob/master/nets.py
+"""
+# Range of disparity/inverse depth values
+DISP_SCALING = 10
+MIN_DISP = 0.01
+"""
+
 def meshgrid_fromHW(H, W, dtype=torch.FloatTensor):
     x = torch.arange(W).type(dtype)
     y = torch.arange(H).type(dtype)
@@ -140,7 +153,7 @@ class Depth34(nn.Module):
     #     self.op_norm = torch.nn.InstanceNorm2d(1)
     
         self.MIN_DISP = 0.01
-        self.DISP_SCALING = 10
+        self.DISP_SCALING = 5
 
     def forward(self, x, enc_only=False):
         inp = x
@@ -196,9 +209,9 @@ class Depth18(nn.Module):
         super().__init__()
         self.rn = rn
         self.sfs = [SaveFeatures(rn[i]) for i in [2,4,5,6]]
-        self.up1 = UnetBlock(256,256,256)
-        self.up2 = UnetBlock(128+1,128,128)
-        self.up3 = UnetBlock(64+1,64,64)
+        self.up1 = UnetBlock(512,256,256)
+        self.up2 = UnetBlock(256+1,128,128)
+        self.up3 = UnetBlock(128+1,64,64)
         self.up4 = UnetBlock(64+1,64,64)
         # self.up5 = UnetBlock(64+1,3,16)
         self.up5 = nn.Sequential(
@@ -213,7 +226,7 @@ class Depth18(nn.Module):
         self.d5 =  Conv( 16, 1, 3, 1, 1, activation_func=nn.Sigmoid() )   
     
         self.MIN_DISP = 0.01
-        self.DISP_SCALING = 10
+        self.DISP_SCALING = 5
 
     def forward(self, x, enc_only=False):
         inp = x
@@ -235,16 +248,16 @@ class Depth18(nn.Module):
             x = self.up3(x, self.sfs[1].features)
 #            d3 = self.fuse3( d2, self.d3(x) )
             d3 = self.d3(x)        
-#             depthmaps.append(d3)
+            depthmaps.append(d3)
             
             x = torch.cat((x, d3), dim=1)
             x = self.up4(x, self.sfs[0].features)
 #            d4 = self.fuse4( d3, self.d4(x) )
             d4 = self.d4(x)
-#             depthmaps.append(d4)
+            depthmaps.append(d4)
             
             x = torch.cat((x, d4), dim=1)
-            X = self.up5(x)
+            x = self.up5(x)
 #             x = self.up5(x, inp)
 #             d5 = self.fuse5( d4, self.d5(x) )
             d5 = self.d5(x)
@@ -545,7 +558,7 @@ class TriAppearanceLoss(nn.Module):
 #         self.sampler2 = BilinearProj()
 
         
-        self.scale = scale        
+        self.scale = float(scale)        
         self.ssim_loss = SSIM()
         self.l1_loss = l1_loss
         #self.imgds = DownSampleLayer(chan=3)
@@ -585,6 +598,31 @@ class TriAppearanceLoss(nn.Module):
         #return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
         
 
+class EdgeAwareLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def grad_x(self, target):
+        return target[:,:,:,:-1] - target[:,:,:,1:]
+    
+    def grad_y(self, target):
+        return target[:,:,:-1] - target[:,:,1:]
+    
+    def forward(self, imgs, ds):
+        img_grad_y = self.grad_y(imgs)
+        img_grad_x = self.grad_x(imgs)
+        
+        disp_grad_y = self.grad_y(imgs)
+        disp_grad_x = self.grad_x(imgs)
+        
+        weight_x = torch.mean( torch.exp( -torch.abs(img_grad_x), dim=1, keepdim=True ) )
+        weight_y = torch.mean( torch.exp( -torch.abs(img_grad_y), dim=1, keepdim=True ) )
+        
+        loss_x = torch.abs(disp_grad_x) * weight_x
+        loss_y = torch.abs(disp_grad_y) * weight_y
+        
+        return torch.mean(loss_x + loss_y)
+        
 class SmoothLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -637,3 +675,19 @@ class PerceptualLoss(nn.Module):
         
     def forward(self, x1, x2):
         return torch.mse(self.perceptor(x1)-self.perceptor(x2))
+    
+class Loss(nn.Module):
+    def __init__(self, scale=10, Tscale=2, ndown=2):
+        super().__init__()
+        self.appr = TriAppearanceLoss(scale=Tscale) #, ndown=ndown)
+        self.smooth = SmoothLoss()
+        self.scale = float(scale)
+    def forward(self, d1s, d2s ,d3s, trans, rotation, x1, x2, x3, camera):
+        appr_loss, details = self.appr(d2s, trans, rotation, x1, x2, x3, camera)
+        smooth_losses = [ 0.5**(i) * self.smooth(d2) for i, d2 in enumerate(d2s) ]
+        #smooth_losses = [ self.smooth(d1)+self.smooth(d2) + self.smooth(d3) for d1, d2, d3 in zip(d1s, d2s, d3s) ]
+        smooth_loss = torch.mean(torch.cat(smooth_losses, dim=0)) * self.scale
+        #print(type(appr_loss))
+        #print(type(smooth_loss))
+        return appr_loss + smooth_loss, (appr_loss, smooth_loss, *details) 
+               
