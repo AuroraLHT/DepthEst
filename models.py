@@ -552,23 +552,16 @@ class TriAppearanceLoss(nn.Module):
     def __init__(self, scale=0.5):
         super().__init__()
         self.offset = Offset3()
-        self.sampler = BilinearProj()
-
-#         self.offset2 = Offset3()
-#         self.sampler2 = BilinearProj()
-
-        
+        self.sampler = BilinearProj()       
         self.scale = float(scale)        
         self.ssim_loss = SSIM()
         self.l1_loss = l1_loss
         #self.imgds = DownSampleLayer(chan=3)
-        #self.depthus = nn.Upsample(scale_factor=2, mode='bilinear')
         
     def forward(self, d2s, trans, rotation, x1, x2, x3, camera):
         l1losses = []
         ssimlosses = []
         for i, d2 in enumerate(d2s):            
-            if i>0: d2 = F.upsample(input=d2, scale_factor=2**i, mode='bilinear')
             
             cx12, cy12, d_mask12 = self.offset.forward(trans[:, 0], rotation[:, 0], inv_depth = d2, camera = camera)
             #cx32, cy32, d_mask32 = self.offset.forward(trans[:, 1], rotation[:, 1], inv_depth = d2, camera = camera)
@@ -612,16 +605,16 @@ class EdgeAwareLoss(nn.Module):
         img_grad_y = self.grad_y(imgs)
         img_grad_x = self.grad_x(imgs)
         
-        disp_grad_y = self.grad_y(imgs)
-        disp_grad_x = self.grad_x(imgs)
+        disp_grad_y = self.grad_y(ds)
+        disp_grad_x = self.grad_x(ds)
         
-        weight_x = torch.mean( torch.exp( -torch.abs(img_grad_x), dim=1, keepdim=True ) )
-        weight_y = torch.mean( torch.exp( -torch.abs(img_grad_y), dim=1, keepdim=True ) )
+        weight_x = torch.mean( torch.exp( -torch.abs(img_grad_x)), dim=1, keepdim=True ) 
+        weight_y = torch.mean( torch.exp( -torch.abs(img_grad_y)), dim=1, keepdim=True ) 
         
         loss_x = torch.abs(disp_grad_x) * weight_x
         loss_y = torch.abs(disp_grad_y) * weight_y
-        
-        return torch.mean(loss_x + loss_y)
+#         pdb.set_trace()
+        return torch.mean(loss_x) + torch.mean(loss_y)
         
 class SmoothLoss(nn.Module):
     def __init__(self):
@@ -680,12 +673,14 @@ class Loss(nn.Module):
     def __init__(self, scale=10, Tscale=2, ndown=2):
         super().__init__()
         self.appr = TriAppearanceLoss(scale=Tscale) #, ndown=ndown)
-        self.smooth = SmoothLoss()
+        self.smooth = EdgeAwareLoss()
+#         self.smooth = SmoothLoss()
         self.scale = float(scale)
-    def forward(self, d1s, d2s ,d3s, trans, rotation, x1, x2, x3, camera):
-        appr_loss, details = self.appr(d2s, trans, rotation, x1, x2, x3, camera)
-        smooth_losses = [ 0.5**(i) * self.smooth(d2) for i, d2 in enumerate(d2s) ]
-        #smooth_losses = [ self.smooth(d1)+self.smooth(d2) + self.smooth(d3) for d1, d2, d3 in zip(d1s, d2s, d3s) ]
+    def forward(self, d1s, d2s ,d3s, trans, rots, x1s, x2s, x3s, cameras):
+        appr_loss, details = self.appr(d2s, trans, rots, x1s, x2s, x3s, cameras)
+        d2s = [F.upsample(input=d2, scale_factor=2**i, mode='bilinear') if i>0 else d2 for d2 in d2s ]
+        smooth_losses = [0.5**i * self.smooth(x2, d2) for x2, d2 in zip(x2s, d2s)]
+#         smooth_losses = [ 0.5**(i) * self.smooth(d2) for i, d2 in enumerate(d2s) ]
         smooth_loss = torch.mean(torch.cat(smooth_losses, dim=0)) * self.scale
         #print(type(appr_loss))
         #print(type(smooth_loss))
