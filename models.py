@@ -567,8 +567,8 @@ def compute_SSIM(img0, img1):
     # img0_img1_pad = torch.nn.ReplicationPad2d(1)(img0 * img1)
     sigma01 = F.avg_pool2d(img0*img1, kernel_size=3, stride=1, padding=0) - mu0*mu1
 
-    C1 = .001
-    C2 = .009
+    C1 = .0001
+    C2 = .0009
 
     ssim_n = (2*mu0*mu1 + C1) * (2*sigma01 + C2)
     ssim_d = (mu0**2 + mu1**2 + C1) * (sigma0 + sigma1 + C2)
