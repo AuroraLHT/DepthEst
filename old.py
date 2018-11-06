@@ -185,18 +185,16 @@ class Offset2(nn.Module):
 def compute_img_stats(img):
     # img_pad = torch.nn.ReplicationPad2d(1)(img)
     img_pad = img
-    mu = F.avg_pool2d(img_pad, kernel_size=3, stride=1, padding=0)
-    sigma = F.avg_pool2d(img_pad**2, kernel_size=3, stride=1, padding=0) - mu**2
+    mu = F.avg_pool2d(img_pad, kernel_size=3, stride=1, padding=1)
+    sigma = F.avg_pool2d(img_pad**2, kernel_size=3, stride=1, padding=1) - mu**2
     return mu, sigma
 
-def compute_SSIM(img0, img1 ):
+def compute_SSIM(img0, img1):
     mu0, sigma0= compute_img_stats(img0) 
     mu1, sigma1= compute_img_stats(img1)
     # img0_img1_pad = torch.nn.ReplicationPad2d(1)(img0 * img1)
-    img0_img1_pad = img0*img1
-    sigma01 = F.avg_pool2d(img0_img1_pad, kernel_size=3, stride=1, padding=0) - mu0*mu1
-    # C1 = .01 ** 2
-    # C2 = .03 ** 2
+    sigma01 = F.avg_pool2d(img0*img1, kernel_size=3, stride=1, padding=0) - mu0*mu1
+
     C1 = .001
     C2 = .009
 
@@ -218,6 +216,9 @@ def ssim_loss(img0, img1, mask):
         )
     )
 
+
+def ssim_loss(img0, img1, mask):
+    return compute_SSIM(img0, img1)
 
 
 class DownSampleLayer(nn.Module):
@@ -277,4 +278,53 @@ class DepthFuseBlock(nn.Module):
     def forward(self, up_d, d):    
         up_d = self.cont(self.up(up_d))
         return self.fuse(torch.cat((up_d, d), dim=1))
+    
+    
+
+
+        
+class SmoothLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.laplacian = LaplacianLayer()
+
+    def forward(self, imgs, masks=None):
+        if masks is not None:
+            return (masks * self.laplacian(imgs)).mean()
+        else:
+            return self.laplacian(imgs).mean()
+
+class LaplacianLayer(nn.Module):
+    def __init__(self):
+        super(LaplacianLayer, self).__init__()
+        w_nom = torch.FloatTensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]]).view(1,1,3,3)
+        w_den = torch.FloatTensor([[0, 1, 0], [1, 4, 1], [0, 1, 0]]).view(1,1,3,3)
+        self.register_buffer('w_nom', w_nom)
+        self.register_buffer('w_den', w_den)
+        
+    def forward(self, input, do_normalize=True):
+        assert(input.dim() == 2 or input.dim()==3 or input.dim()==4)
+        input_size = input.size()
+
+        x = input.view(input_size[0]*input_size[1], 1, input_size[2], input_size[3])
+        x_nom = F.conv2d(
+            input=x,
+            weight=V(self.w_nom),
+            stride=1,
+            padding=0
+        )
+        if do_normalize:
+            x_den = F.conv2d(
+                input=x,
+                weight=V(self.w_den),
+                stride=1,
+                padding=0
+            )
+                      
+            x = (x_nom.abs()/x_den)
+        else:
+            x = x_nom.abs()
+            
+        return x.view(input_size[0], input_size[1], input_size[2]-2, input_size[3]-2)
+
     

@@ -114,7 +114,7 @@ class Pose(nn.Module):
             nn.AdaptiveAvgPool2d((1,1))
         )
         
-        self.tran_mag = 0.001
+        self.tran_mag = 0.01
         self.rot_mag= 0.01
         
     def forward(self, x):
@@ -192,7 +192,8 @@ class Depth34(nn.Module):
             depthmaps = [ d * self.DISP_SCALING + self.MIN_DISP for d in depthmaps ]
                             
             depthmaps.reverse()
-
+        else:
+            depthmaps = [None, None, None]
         # return disparity map and the output of the encoder
         return depthmaps, self.sfs[3].features
         # return DISP_SCALING * F.sigmoid(x) + MIN_DISP, self.sfs[3].features #, x
@@ -274,18 +275,19 @@ class Depth18(nn.Module):
         for sf in self.sfs: sf.remove()            
             
 class TriDepth(nn.Module):
-    def __init__(self, rn, ochannel):
+    def __init__(self, rn, ochannel, setting=[True, False, True]):
         super().__init__()
         self.depth = Depth18(rn, ochannel) 
 #         self.depth = Depth34(rn, ochannel) 
         self.pose = Pose(256*3)
         #self.train = train
+        self.setting=setting
         
     def forward(self, x1, x2, x3):
 
-        d1, ft1 = self.depth(x1, enc_only=True) # src
-        d2, ft2 = self.depth(x2, enc_only=False) # target
-        d3, ft3 = self.depth(x3, enc_only=True) # src
+        d1, ft1 = self.depth(x1, enc_only=self.setting[0]) # src
+        d2, ft2 = self.depth(x2, enc_only=self.setting[1]) # target, src
+        d3, ft3 = self.depth(x3, enc_only=self.setting[2]) # src, target
 
 #         if self.train:
 #             d1, ft1 = self.depth(x1, enc_only=True) # src
@@ -338,15 +340,18 @@ class Offset3(nn.Module):
         K = torch.cat((o, -K2, K1, K2, o, K0, -K1, K0, o), 1).view(-1, 3, 3) # form a cpro matrix
         return eye + K * angles.sin() + torch.bmm(K,K) * (1-angles.cos()) # using the R formular
     
-    def pose_vec2mat(self, trans, rotation):
+    def pose_vec2mat(self, trans, rotation, reverse=False):
         b = trans.size(0)
         rot_vecs = rotation
-        tran_vecs = trans
+        tran_vecs = trans.unsqueeze(-1)
 
         rot_mats = self.rot_vec2mat(rot_vecs)
-
+        if reverse: 
+            rot_mats = torch.transpose(rot_mats, 1, 2)
+            tran_vecs = torch.bmm(rot_mats, -tran_vecs)
+        
         # stack these trans together w.r.t the column
-        pose = torch.cat((rot_mats, tran_vecs.unsqueeze(-1)), dim=-1)
+        pose = torch.cat((rot_mats, tran_vecs), dim=-1)
         pose = torch.cat((pose, V(self.filler.repeat(b, 1, 1))), dim=-2)
 
         return pose
@@ -359,7 +364,6 @@ class Offset3(nn.Module):
         
         cam_coors = torch.matmul(inv_intrinsics, pixel_coors).squeeze(-1)
         #pdb.set_trace()
-        # cam_coors = cam_coors * inv_depth
         cam_coors = cam_coors / inv_depth
         if ishomo:
             cam_coors = torch.cat((cam_coors, V(torch.ones(b, h, w, 1))), dim=-1)
@@ -383,7 +387,7 @@ class Offset3(nn.Module):
         #pdb.set_trace()
         return x_n, y_n, V(z_u.data>EPS)
     
-    def forward(self, trans, rotation, inv_depth, camera):
+    def forward(self, trans, rotation, inv_depth, camera, reverse=False):
         
         """
             Params:
@@ -421,7 +425,7 @@ class Offset3(nn.Module):
         intrinsics = V(intrinsics)
         inv_intrinsics = V(inv_intrinsics)
 
-        pose = self.pose_vec2mat(trans, rotation)
+        pose = self.pose_vec2mat(trans, rotation, reverse=reverse)
        
         # grip points preperation
         px, py = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
@@ -475,7 +479,9 @@ def l1_loss(x1, x2, mask):
 #     diffs = torch.sum(diffs/masksum, 1)
 #     return torch.mean(diffs)
     return F.l1_loss(x1, x2)
-    
+
+
+
 
 
 # Copy from pytorch_ssim repo
@@ -548,47 +554,78 @@ class SSIM(nn.Module):
         return _ssim(img1, img2, mask, self.window, self.window_size, self.channel, self.size_average)
 
 
+def compute_img_stats(img):
+    # img_pad = torch.nn.ReplicationPad2d(1)(img)
+    img_pad = img
+    mu = F.avg_pool2d(img_pad, kernel_size=3, stride=1, padding=0)
+    sigma = F.avg_pool2d(img_pad**2, kernel_size=3, stride=1, padding=0) - mu**2
+    return mu, sigma
+
+def compute_SSIM(img0, img1):
+    mu0, sigma0= compute_img_stats(img0) 
+    mu1, sigma1= compute_img_stats(img1)
+    # img0_img1_pad = torch.nn.ReplicationPad2d(1)(img0 * img1)
+    sigma01 = F.avg_pool2d(img0*img1, kernel_size=3, stride=1, padding=0) - mu0*mu1
+
+    C1 = .001
+    C2 = .009
+
+    ssim_n = (2*mu0*mu1 + C1) * (2*sigma01 + C2)
+    ssim_d = (mu0**2 + mu1**2 + C1) * (sigma0 + sigma1 + C2)
+    ssim = ssim_n / ssim_d
+    return ((1-ssim)*.5).clamp(0, 1)
+
+
+def ssim_loss(img0, img1, mask):
+    return compute_SSIM(img0, img1)
+
+    
+
 class TriAppearanceLoss(nn.Module):
-    def __init__(self, scale=0.5):
+    def __init__(self, scale=0.5, warp_setting=[False, True, False, False]):
         super().__init__()
         self.offset = Offset3()
         self.sampler = BilinearProj()       
         self.scale = float(scale)        
-        self.ssim_loss = SSIM()
+#         self.ssim_loss = SSIM()
+        self.ssim_loss = ssim_loss
         self.l1_loss = l1_loss
-        #self.imgds = DownSampleLayer(chan=3)
+        self.warp_setting = warp_setting
+    
+    def warp(self, srcs, trans, rotations, inv_depth, camera, reverse=False):
+        cx, cy, d_mask = self.offset(trans, rotations, inv_depth, camera, reverse=reverse)
+        xwarp, in_mask = self.sampler(srcs, cx, cy)
+        mask = (d_mask*in_mask).unsqueeze(1)    
+        mask.requires_grad = False
+        return xwarp, mask
         
-    def forward(self, d2s, trans, rotation, x1, x2, x3, camera):
+    def forward(self, d1s, d2s, d3s, trans, rotations, x1, x2, x3, camera):
         l1losses = []
         ssimlosses = []
-        for i, d2 in enumerate(d2s):            
+               
+        for i, (d1,d2,d3) in enumerate(zip(d1s,d2s,d3s)):            
             
-            cx12, cy12, d_mask12 = self.offset.forward(trans[:, 0], rotation[:, 0], inv_depth = d2, camera = camera)
-            #cx32, cy32, d_mask32 = self.offset.forward(trans[:, 1], rotation[:, 1], inv_depth = d2, camera = camera)
-            #cx32, cy32, d_mask32 = self.offset2.forward(trans[:, 1], rotation[:, 1], inv_depth = d2, camera = camera)
+            if self.warp_setting[0]:
+                x21, mask21 = self.warp(x2,trans[:, 0], rotations[:, 0], d1, camera, reverse=True)
+                l1losses.append(self.l1_loss(x21, x1, mask21))
+                ssimlosses.append(self.ssim_loss(x21, x1, mask21))
+            if self.warp_setting[1]:
+                x12, mask12 = self.warp(x1,trans[:, 0], rotations[:, 0], d2, camera, reverse=False)
+                l1losses.append(self.l1_loss(x12, x2, mask12))
+                ssimlosses.append(self.ssim_loss(x12, x2, mask12))
+            if self.warp_setting[2]:    
+                x32, mask32 = self.warp(x3,trans[:, 1], rotations[:, 1], d2, camera, reverse=False)
+                l1losses.append(self.l1_loss(x32, x2, mask32))
+                ssimlosses.append(self.ssim_loss(x32, x2, mask32))
+            if self.warp_setting[3]:
+                x23, mask23 = self.warp(x2,trans[:, 1], rotations[:, 1], d3, camera, reverse=True)
+                l1losses.append(self.l1_loss(x23, x3, mask23))
+                ssimlosses.append(self.ssim_loss(x23, x3, mask23))
+                    
+        l1loss = (1-self.scale) * torch.mean(torch.cat(l1losses, dim=0))
+        ssimloss = self.scale * torch.mean(torch.cat(ssimlosses, dim=0))
 
-            x12, in_mask12 = self.sampler.forward(x1, cx12, cy12)
-#             x32, in_mask32 = self.sampler.forward(x3, cx32, cy32)
-#             x32, in_mask32 = self.sampler2.forward(x3, cx32, cy32)
-
-            mask12 = (d_mask12*in_mask12).unsqueeze(1)
-#             mask32 = (d_mask32*in_mask32).unsqueeze(1)
-            
-            mask12.requires_grad = False
-#             mask32.requires_grad = False
-            
-            # loss on original scale
-            l1losses.append(self.l1_loss(x12, x2, mask12))
-            ssimlosses.append(self.ssim_loss(x12, x2, mask12))       
-            
-#             l1losses.append( self.l1_loss(x12, x2, mask12) + self.l1_loss(x32, x2, mask32) )
-#             ssimlosses.append( self.ssim_loss(x12, x2, mask12) + self.ssim_loss(x32, x2, mask32) )       
-        
-        l1loss = torch.mean(torch.cat(l1losses, dim=0))
-        ssimloss = torch.mean(torch.cat(ssimlosses, dim=0))
-
-        return (1-self.scale) * ssimloss + self.scale * l1loss, ((1-self.scale) * ssimloss, self.scale * l1loss)
-        #return ssimloss + self.scale * l1loss, (ssimloss, self.scale * l1loss)
+        return ssimloss + l1loss, (ssimloss, l1loss)
         
 
 class EdgeAwareLoss(nn.Module):
@@ -605,6 +642,9 @@ class EdgeAwareLoss(nn.Module):
         img_grad_y = self.grad_y(imgs)
         img_grad_x = self.grad_x(imgs)
         
+#         normalize the depth map to make the magnitude be consistance
+        ds = ds / torch.mean( torch.mean(ds, dim=2, keepdim=True), dim=3, keepdim=True)
+        
         disp_grad_y = self.grad_y(ds)
         disp_grad_x = self.grad_x(ds)
         
@@ -613,53 +653,7 @@ class EdgeAwareLoss(nn.Module):
         
         loss_x = torch.abs(disp_grad_x) * weight_x
         loss_y = torch.abs(disp_grad_y) * weight_y
-#         pdb.set_trace()
         return torch.mean(loss_x) + torch.mean(loss_y)
-        
-class SmoothLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.laplacian = LaplacianLayer()
-
-    def forward(self, imgs, masks=None):
-        if masks is not None:
-            return (masks * self.laplacian(imgs)).mean()
-        else:
-            return self.laplacian(imgs).mean()
-
-class LaplacianLayer(nn.Module):
-    def __init__(self):
-        super(LaplacianLayer, self).__init__()
-        w_nom = torch.FloatTensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]]).view(1,1,3,3)
-        w_den = torch.FloatTensor([[0, 1, 0], [1, 4, 1], [0, 1, 0]]).view(1,1,3,3)
-        self.register_buffer('w_nom', w_nom)
-        self.register_buffer('w_den', w_den)
-        
-    def forward(self, input, do_normalize=True):
-        assert(input.dim() == 2 or input.dim()==3 or input.dim()==4)
-        input_size = input.size()
-
-        x = input.view(input_size[0]*input_size[1], 1, input_size[2], input_size[3])
-        x_nom = F.conv2d(
-            input=x,
-            weight=V(self.w_nom),
-            stride=1,
-            padding=0
-        )
-        if do_normalize:
-            x_den = F.conv2d(
-                input=x,
-                weight=V(self.w_den),
-                stride=1,
-                padding=0
-            )
-                      
-            x = (x_nom.abs()/x_den)
-        else:
-            x = x_nom.abs()
-            
-        return x.view(input_size[0], input_size[1], input_size[2]-2, input_size[3]-2)
-
 
 class PerceptualLoss(nn.Module):
     def __init__(self):
@@ -670,19 +664,27 @@ class PerceptualLoss(nn.Module):
         return torch.mse(self.perceptor(x1)-self.perceptor(x2))
     
 class Loss(nn.Module):
-    def __init__(self, scale=10, Tscale=2, ndown=2):
+    def __init__(self, smooth_scale=0.5, appr_scale=0.85, warp_setting=[False, True, False, False]):
         super().__init__()
-        self.appr = TriAppearanceLoss(scale=Tscale) #, ndown=ndown)
+        self.appr = TriAppearanceLoss(scale=appr_scale, warp_setting=warp_setting)
         self.smooth = EdgeAwareLoss()
 #         self.smooth = SmoothLoss()
-        self.scale = float(scale)
+        self.scale = float(smooth_scale)
+    
     def forward(self, d1s, d2s ,d3s, trans, rots, x1s, x2s, x3s, cameras):
-        appr_loss, details = self.appr(d2s, trans, rots, x1s, x2s, x3s, cameras)
-        d2s = [F.upsample(input=d2, scale_factor=2**i, mode='bilinear') if i>0 else d2 for d2 in d2s ]
-        smooth_losses = [0.5**i * self.smooth(x2, d2) for x2, d2 in zip(x2s, d2s)]
-#         smooth_losses = [ 0.5**(i) * self.smooth(d2) for i, d2 in enumerate(d2s) ]
-        smooth_loss = torch.mean(torch.cat(smooth_losses, dim=0)) * self.scale
-        #print(type(appr_loss))
-        #print(type(smooth_loss))
+        if d1s[0] is not None:
+            d1s = [F.upsample(input=d1, scale_factor=2**i, mode='bilinear') if i>0 else d1 for i, d1 in enumerate(d1s) ]          
+        if d2s[0] is not None:
+            d2s = [F.upsample(input=d2, scale_factor=2**i, mode='bilinear') if i>0 else d2 for i, d2 in enumerate(d2s) ]
+        if d3s[0] is not None:
+            d3s = [F.upsample(input=d3, scale_factor=2**i, mode='bilinear') if i>0 else d3 for i, d3 in enumerate(d3s) ]
+        
+        appr_loss, details = self.appr(d1s, d2s ,d3s, trans, rots, x1s, x2s, x3s, cameras)
+
+        smooth_losses = [0.5**i * self.smooth(x2s, d2) for i, d2 in enumerate(d2s)]
+        if d1s[0] is not None: smooth_losses += [0.5**i * self.smooth(x1s, d1) for i, d1 in enumerate(d1s)]
+        if d3s[0] is not None: smooth_losses += [0.5**i * self.smooth(x3s, d3) for i, d3 in enumerate(d1s)]
+
+        smooth_loss = self.scale * torch.mean(torch.cat(smooth_losses, dim=0))  
         return appr_loss + smooth_loss, (appr_loss, smooth_loss, *details) 
                
