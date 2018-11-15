@@ -452,14 +452,6 @@ def _ssim(img1, img2, mask, window, window_size, channel, size_average = True):
 
     ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
     ssim_map = 1 - ssim_map
-#    size = mask.size()
-#    masksum = mask.view(size[0], size[1], -1).sum(-1, keepdim=False) + 1
-#     pdb.set_trace()
-#    ssim_map = ssim_map.view(size[0], size[1], -1).sum(-1, keepdim=False)
-#     pdb.set_trace()
-#    ssim_map = (ssim_map/masksum).sum(-1, keepdim=False)
-#     pdb.set_trace()
-#    return torch.mean(ssim_map)
     
     if size_average:
         return ssim_map.mean()
@@ -476,25 +468,12 @@ class SSIM(nn.Module):
         self.register_buffer('window', create_window(window_size, self.channel) )
 
     def forward(self, img1, img2, mask):
-        (_, channel, _, _) = img1.size()
-
-        #if channel == self.channel and self.window.data.type() == img1.data.type():
-        #    window = self.window
-        #else:
-        #    window = create_window(self.window_size, channel)
-           
-        #    if img1.is_cuda:
-        #        window = window.cuda(img1.get_device())
-        #    window = window.type_as(img1)
-           
-        #    self.window = window
-        #    self.channel = channel
         return _ssim(img1, img2, mask, self.window, self.window_size, self.channel, self.size_average)
 
 
 def compute_img_stats(img):
-    # img_pad = torch.nn.ReplicationPad2d(1)(img)
-    img_pad = img
+    # the padding is to maintain the original size
+    img_pad = F.pad(img, 1, mode='reflect')
     mu = F.avg_pool2d(img_pad, kernel_size=3, stride=1, padding=0)
     sigma = F.avg_pool2d(img_pad**2, kernel_size=3, stride=1, padding=0) - mu**2
     return mu, sigma
@@ -502,8 +481,9 @@ def compute_img_stats(img):
 def compute_SSIM(img0, img1):
     mu0, sigma0= compute_img_stats(img0) 
     mu1, sigma1= compute_img_stats(img1)
-    # img0_img1_pad = torch.nn.ReplicationPad2d(1)(img0 * img1)
-    sigma01 = F.avg_pool2d(img0*img1, kernel_size=3, stride=1, padding=0) - mu0*mu1
+    # the padding is to maintain the original size
+    img0_img1_pad = F.pad(img0 * img1, 1, mode='reflect')
+    sigma01 = F.avg_pool2d(img0_img1_pad, kernel_size=3, stride=1, padding=0) - mu0*mu1
 
     C1 = .0001
     C2 = .0009
@@ -516,15 +496,28 @@ def compute_SSIM(img0, img1):
 def ssim_loss(img0, img1, mask):
     return torch.mean(compute_SSIM(img0, img1))
 
+def combine_loss(img0, img1, scale, is_per_pixel_min=True):
+    l1_diff = torch.abs(img0 - img1)
+    ssim_diff = compute_SSIM(img0, img1)
+    if is_per_pixel_min: 
+        l1_diff = (1-scale)*l1_diff
+        ssim_diff = scale*ssim_diff
+        min_pixel, which = torch.min( l1_diff + ssim_diff, dim=0 )
+        return torch.mean(min_pixel), (torch.mean(ssim_diff[which]), torch.mean(l1_diff[which])) 
+    else:
+        ssim_loss = scale*torch.mean(ssim_diff)
+        l1_loss = (1-scale)*torch.mean(l1_diff)
+        return  l1_loss + ssim_loss, (ssim_loss, l1_loss) 
+
 class TriAppearanceLoss(nn.Module):
     def __init__(self, scale=0.5, warp_setting=[False, True, False, False]):
         super().__init__()
         self.offset = Offset3()
         self.sampler = BilinearProj()       
         self.scale = float(scale)        
-#         self.ssim_loss = SSIM()
-        self.ssim_loss = ssim_loss
-        self.l1_loss = l1_loss
+        # self.ssim_loss = SSIM()
+        # self.ssim_loss = ssim_loss
+        # self.l1_loss = l1_loss
         self.warp_setting = warp_setting
     
     def warp(self, srcs, trans, rotations, inv_depth, camera, reverse=False):
@@ -540,47 +533,48 @@ class TriAppearanceLoss(nn.Module):
         l1loss = 0
         ssimloss = 0
         loss = 0
-        for i, (d1,d2,d3) in enumerate(zip(d1s,d2s,d3s)):            
-            l1losses = []
-            ssimlosses = []
+
+        for d1,d2,d3 in zip(d1s,d2s,d3s):            
+            warp_stack = []
+            target_stack = []
 
             if self.warp_setting[0]:
                 x21, mask21 = self.warp(x2,trans[:, 0], rotations[:, 0], d1, camera, reverse=True)
 #                 x21, x1 = x21*mask21, x1*mask21
-                l1losses.append( self.l1_loss(x21, x1, mask21) )
-                ssimlosses.append(self.ssim_loss(x21, x1, mask21) )
+                target_stack.append(x1)
+                warp_stack.append(x21)
+
             if self.warp_setting[1]:
                 x12, mask12 = self.warp(x1,trans[:, 0], rotations[:, 0], d2, camera, reverse=False)
 #                 x12, x2_12= x12*mask12, x2*mask12
                 x2_12 = x2
-                l1losses.append(self.l1_loss(x12, x2_12, mask12) )
-                ssimlosses.append(self.ssim_loss(x12, x2_12, mask12) )
+                target_stack.append(x2_12)
+                warp_stack.append(x12)
+
             if self.warp_setting[2]:    
                 x32, mask32 = self.warp(x3,trans[:, 1], rotations[:, 1], d2, camera, reverse=False)
 #                 x32, x2_32 = x32*mask32, x2*mask32
                 x2_32 = x2
-                l1losses.append(self.l1_loss(x32, x2_32, mask32) )
-                ssimlosses.append(self.ssim_loss(x32, x2_32, mask32) )
+                target_stack.append(x2_32)
+                warp_stack.append(x32)
+
             if self.warp_setting[3]:
                 x23, mask23 = self.warp(x2,trans[:, 1], rotations[:, 1], d3, camera, reverse=True)
 #                 x23, x3 = x23*mask23, x3*mask23
-                l1losses.append(self.l1_loss(x23, x3, mask23) )
-                ssimlosses.append(self.ssim_loss(x23, x3, mask23) )
-                    
-            l1losses = (1-self.scale)* torch.cat(l1losses, dim=0)
-            ssimlosses = (self.scale)* torch.cat(ssimlosses, dim=0)
-            losses = l1losses + ssimlosses
-            
-            min_loss, minloss_index = torch.min(losses, dim=0)
-            
-            loss += min_loss
-            l1loss += l1losses[minloss_index]
-            ssimloss += ssimlosses[minloss_index]
+                target_stack.append(x3)
+                warp_stack.append(x23)
+
+            target_stack = torch.stack(target_stack, dim=0)
+            warp_stack = torch.stack(warp_stack, dim=0)
+            single_loss, details = combine_loss(target_stack, warp_stack, self.scale, is_per_pixel_min=True)
+
+            loss += single_loss
+            ssimloss += details[0]
+            l1loss += details[1]
 #             pdb.set_trace()
-        
+        loss = loss/len(d1s)
         l1loss = l1loss/len(d1s)
         ssimloss = ssimloss/len(d2s)
-    
         return loss, (ssimloss, l1loss)
         
 
