@@ -262,6 +262,8 @@ class Offset3(nn.Module):
         self.register_buffer('eye', torch.eye(3).type(torch.FloatTensor).unsqueeze(0))
         self.register_buffer('filler', torch.FloatTensor([0,0,0,1]).unsqueeze(0))
         
+        self.pixel_coords = None
+        
     def factorize(self, vecs, dim):
         mags = vecs.norm(p=2, dim=dim, keepdim=True)
         return vecs/mags, mags
@@ -329,6 +331,18 @@ class Offset3(nn.Module):
         #pdb.set_trace()
         return x_n, y_n, V(z_u.data>EPS)
     
+    def get_pixel_coords(self, h, w, b, dtype):
+        if self.pixel_coords is not None:
+            sb, _, sh, sw= self.pixel_coords.shape
+            if sh == h and sw == w and sb == b:
+                return self.pixel_coords
+            
+        px, py = meshgrid_fromHW(h, w, dtype=dtype)
+        pixel_coords = torch.stack([px, py, torch.ones_like(px)], dim=-1).repeat(b, 1, 1, 1)
+        self.pixel_coords = pixel_coords
+        return self.pixel_coords
+
+    
     def forward(self, trans, rotation, inv_depth, camera, reverse=False):
         
         """
@@ -370,10 +384,8 @@ class Offset3(nn.Module):
         pose = self.pose_vec2mat(trans, rotation, reverse=reverse)
        
         # grip points preperation
-        px, py = meshgrid_fromHW(h, w, dtype=type(inv_depth.data))
-        pixel_coords = torch.stack([px, py, torch.ones_like(px)], dim=-1).repeat(b, 1, 1, 1)
+        pixel_coords = self.get_pixel_coords(h, w, b, type(inv_depth.data))        
         pixel_coords = V(pixel_coords)
-        
         cam_coords = self.pixel2cam(inv_depth, pixel_coords, inv_intrinsics)
         
         proj_tgt_cam_to_src_pixel = torch.matmul(intrinsics, pose)
@@ -473,7 +485,7 @@ class SSIM(nn.Module):
 
 def compute_img_stats(img):
     # the padding is to maintain the original size
-    img_pad = F.pad(img, 1, mode='reflect')
+    img_pad = F.pad(img, (1,1,1,1), mode='reflect')
     mu = F.avg_pool2d(img_pad, kernel_size=3, stride=1, padding=0)
     sigma = F.avg_pool2d(img_pad**2, kernel_size=3, stride=1, padding=0) - mu**2
     return mu, sigma
@@ -482,7 +494,7 @@ def compute_SSIM(img0, img1):
     mu0, sigma0= compute_img_stats(img0) 
     mu1, sigma1= compute_img_stats(img1)
     # the padding is to maintain the original size
-    img0_img1_pad = F.pad(img0 * img1, 1, mode='reflect')
+    img0_img1_pad = F.pad(img0 * img1, (1,1,1,1), mode='reflect')
     sigma01 = F.avg_pool2d(img0_img1_pad, kernel_size=3, stride=1, padding=0) - mu0*mu1
 
     C1 = .0001
@@ -496,30 +508,61 @@ def compute_SSIM(img0, img1):
 def ssim_loss(img0, img1, mask):
     return torch.mean(compute_SSIM(img0, img1))
 
-def combine_loss(img0, img1, scale, is_per_pixel_min=True):
-    l1_diff = torch.abs(img0 - img1)
-    ssim_diff = compute_SSIM(img0, img1)
-    if is_per_pixel_min: 
-        l1_diff = (1-scale)*l1_diff
-        ssim_diff = scale*ssim_diff
-        min_pixel, which = torch.min( l1_diff + ssim_diff, dim=0 )
-        return torch.mean(min_pixel), (torch.mean(ssim_diff[which]), torch.mean(l1_diff[which])) 
-    else:
+def combine_loss( is_per_pixel_min=True):
+    def _combine_loss_mean(target_stack, src_stack, scale):
+        img0 = torch.cat(target_stack, dim=0)
+        img1 = torch.cat(src_stack, dim=0)
+
+        l1_diff = torch.abs(img0 - img1)
+        ssim_diff = compute_SSIM(img0, img1)
+
         ssim_loss = scale*torch.mean(ssim_diff)
         l1_loss = (1-scale)*torch.mean(l1_diff)
         return  l1_loss + ssim_loss, (ssim_loss, l1_loss) 
 
+    def _combine_loss_min(target_stack, src_stack, scale):
+        img0 = torch.cat(target_stack, dim=0)
+        img1 = torch.cat(src_stack, dim=0)
+
+        l1_diff = torch.abs(img0 - img1)
+        ssim_diff = compute_SSIM(img0, img1)
+
+        l1_diff = (1-scale)*l1_diff
+        ssim_diff = scale*ssim_diff
+        
+        multib, c, h, w= img0.size()
+        b, mul = multib//len(target_stack), len(target_stack)
+        l1_diff = l1_diff.view(mul, b, c, h ,w)
+        ssim_diff = ssim_diff.view(mul, b, c, h, w)
+        
+        min_pixel, which = torch.min(l1_diff + ssim_diff, dim=0, keepdim=True)
+#         pdb.set_trace()
+        loss = torch.mean(min_pixel)
+        return loss, (loss, loss) 
+
+    if is_per_pixel_min:
+        return _combine_loss_min
+    
+    else:
+        return _combine_loss_mean
+    
 class TriAppearanceLoss(nn.Module):
-    def __init__(self, scale=0.5, warp_setting=[False, True, False, False]):
+    def __init__(self, scale=0.5, warp_setting=[False, True, False, False], is_per_pixel_min=True, is_mask=False):
         super().__init__()
         self.offset = Offset3()
         self.sampler = BilinearProj()       
+        
+        self.warp_setting = warp_setting
+        
         self.scale = float(scale)        
+        self.is_per_pixel_min=is_per_pixel_min
+        self.is_mask = is_mask
+        
         # self.ssim_loss = SSIM()
         # self.ssim_loss = ssim_loss
         # self.l1_loss = l1_loss
-        self.warp_setting = warp_setting
-    
+        self.combine_loss = combine_loss(is_per_pixel_min)
+        
     def warp(self, srcs, trans, rotations, inv_depth, camera, reverse=False):
         cx, cy, d_mask = self.offset(trans, rotations, inv_depth, camera, reverse=reverse)
         xwarp, in_mask = self.sampler(srcs, cx, cy)
@@ -540,33 +583,31 @@ class TriAppearanceLoss(nn.Module):
 
             if self.warp_setting[0]:
                 x21, mask21 = self.warp(x2,trans[:, 0], rotations[:, 0], d1, camera, reverse=True)
-#                 x21, x1 = x21*mask21, x1*mask21
+                if self.is_mask: x21, x1 = x21*mask21, x1*mask21
                 target_stack.append(x1)
                 warp_stack.append(x21)
 
             if self.warp_setting[1]:
                 x12, mask12 = self.warp(x1,trans[:, 0], rotations[:, 0], d2, camera, reverse=False)
-#                 x12, x2_12= x12*mask12, x2*mask12
-                x2_12 = x2
+                if self.is_mask: x12, x2_12 = x12*mask12, x2*mask12
+                else: x2_12 = x2
                 target_stack.append(x2_12)
                 warp_stack.append(x12)
 
             if self.warp_setting[2]:    
                 x32, mask32 = self.warp(x3,trans[:, 1], rotations[:, 1], d2, camera, reverse=False)
-#                 x32, x2_32 = x32*mask32, x2*mask32
-                x2_32 = x2
+                if self.is_mask: x32, x2_32 = x32*mask32, x2*mask32
+                else: x2_32 = x2
                 target_stack.append(x2_32)
                 warp_stack.append(x32)
 
             if self.warp_setting[3]:
                 x23, mask23 = self.warp(x2,trans[:, 1], rotations[:, 1], d3, camera, reverse=True)
-#                 x23, x3 = x23*mask23, x3*mask23
+                if self.is_mask: x23, x3 = x23*mask23, x3*mask23
                 target_stack.append(x3)
                 warp_stack.append(x23)
-
-            target_stack = torch.stack(target_stack, dim=0)
-            warp_stack = torch.stack(warp_stack, dim=0)
-            single_loss, details = combine_loss(target_stack, warp_stack, self.scale, is_per_pixel_min=True)
+            
+            single_loss, details = self.combine_loss(target_stack, warp_stack, self.scale)
 
             loss += single_loss
             ssimloss += details[0]
@@ -593,7 +634,7 @@ class EdgeAwareLoss(nn.Module):
         img_grad_x = self.grad_x(imgs)
         
 #         normalize the depth map to make the magnitude be consistance
-#         ds = ds / torch.mean( torch.mean(ds, dim=2, keepdim=True), dim=3, keepdim=True)
+        ds = ds / torch.mean( torch.mean(ds, dim=2, keepdim=True), dim=3, keepdim=True)
         
         disp_grad_y = self.grad_y(ds)
         disp_grad_x = self.grad_x(ds)
@@ -616,9 +657,9 @@ class PerceptualLoss(nn.Module):
         return torch.mse(self.perceptor(x1)-self.perceptor(x2))
     
 class Loss(nn.Module):
-    def __init__(self, smooth_scale=0.5, appr_scale=0.85, warp_setting=[False, True, False, False]):
+    def __init__(self, smooth_scale=0.5, appr_scale=0.85, warp_setting=[False, True, False, False], is_per_pixel_min=True, is_mask=False):
         super().__init__()
-        self.appr = TriAppearanceLoss(scale=appr_scale, warp_setting=warp_setting)
+        self.appr = TriAppearanceLoss(scale=appr_scale, warp_setting=warp_setting, is_per_pixel_min=is_per_pixel_min, is_mask=is_mask)
         self.smooth = EdgeAwareLoss()
 #         self.smooth = SmoothLoss()
         self.scale = float(smooth_scale)

@@ -123,13 +123,15 @@ def shuffle(dataframe):
         dataframe = dataframe.sample(frac=1)
     return dataframe.reset_index(drop=True)
 
-def plot_img(recon, index, denorm, figsize=(12,4)):
-    recon = denorm(recon)[index]
+def plot_img(recon, index, figsize=(12,4)):
+    # input image: R [0,1]
+    recon = recon[index].cpu().permute(1,2,0).data.numpy()
+    print(recon.min(), recon.max())
     plt.figure(figsize=figsize)
     plt.imshow(recon)
     plt.axis('off')    
 
-def plot_depth(depths, index=0, figsize=(12,4), scale=50, inv=False):
+def plot_depth(depths, index=0, figsize=(12,4), scale=50, inv=False, cb=True, cmap='plasma'):
     inv_depth = depths.cpu().data[index].numpy()
     inv_depth = np.clip(inv_depth, a_min=0.01, a_max=None)
     if inv:
@@ -141,11 +143,9 @@ def plot_depth(depths, index=0, figsize=(12,4), scale=50, inv=False):
     plt.figure(figsize=figsize)
     plt.imshow(
         depth*scale,
-        cmap="jet",
-        #vmin=max(m - 2*std, 0),
-        #vmax=min(m+2*std, mx)
+        cmap=cmap,
     )
-    plt.colorbar()
+    if cb: plt.colorbar()
     plt.axis('off')
     
 def plot_mask(masks, index=0, figsize=(12,4)):
@@ -155,6 +155,9 @@ def plot_mask(masks, index=0, figsize=(12,4)):
     plt.imshow(mask.cpu().data.numpy(),cmap="gray", vmin=0, vmax=1)
     plt.colorbar()
     plt.axis('off')
+
+def plot_losses(losses):
+    plt.plot(np.arange(len(losses)), np.array(losses))    
     
 def tonp(tensor):
     return tensor.cpu().data.numpy()
@@ -167,3 +170,15 @@ def save_res(img, recon, depth, path, figsize=(12,12)):
     axs[2].imshow(recon)
     fig.savefig(path)
     plt.close(fig)
+    
+    
+class LossCollect:
+    def __init__(self, nslot):
+        self.collections = [list() for i in range(nslot)]
+        
+    def collect(self, *args):
+        for i, arg in enumerate(args):
+            self.collections[i].append(arg)
+            
+    def show(self, n=5):
+        return [np.mean(self.collections[i][-n:]) for i in range(len(self.collections))]
